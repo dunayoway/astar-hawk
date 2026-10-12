@@ -10,63 +10,26 @@ require("dotenv").config();
 
 function required(name) {
   const value = process.env[name];
-
-  if (!value) {
-    throw new Error(`Missing required environment variable: ${name}`);
-  }
-
+  if (!value) throw new Error(`Missing required environment variable: ${name}`);
   return value;
 }
 
 const CONFIG = {
   wss: required("ASTAR_WSS"),
-
   execMnemonic: process.env.EXEC_MNEMONIC,
   execPrivateKey: process.env.EXEC_PRIVATE_KEY,
-
   sponsorMnemonic: process.env.SPONSOR_MNEMONIC,
   sponsorPrivateKey: process.env.SPONSOR_PRIVATE_KEY,
-
   vault: required("VAULT_ADDRESS"),
-
-  expectedSpecVersion: Number(process.env.EXPECTED_SPEC_VERSION || "2400"),
-
+  expectedSpecVersion: Number(process.env.EXPECTED_SPEC_VERSION || "2500"),
   rpcMaxRetries: Number(process.env.RPC_MAX_RETRIES || "6"),
-
   feeSafetyBps: BigInt(process.env.FEE_SAFETY_BPS || "2000"),
-
   minRemainingAstr: process.env.MIN_REMAINING_ASTR || "0.00001",
-
-  reconnectInitialDelayMs: Number(
-    process.env.RECONNECT_INITIAL_DELAY_MS || "1000",
-  ),
-
+  reconnectInitialDelayMs: Number(process.env.RECONNECT_INITIAL_DELAY_MS || "1000"),
   reconnectMaxDelayMs: Number(process.env.RECONNECT_MAX_DELAY_MS || "30000"),
-
-  rpcRetryInitialDelayMs: Number(
-    process.env.RPC_RETRY_INITIAL_DELAY_MS || "500",
-  ),
-
+  rpcRetryInitialDelayMs: Number(process.env.RPC_RETRY_INITIAL_DELAY_MS || "500"),
   rpcRetryMaxDelayMs: Number(process.env.RPC_RETRY_MAX_DELAY_MS || "10000"),
-
-  /*
-   * Extra sponsor funding safety.
-   *
-   * This is added on top of the transaction fee safety.
-   *
-   * Example:
-   *
-   * estimated fee = 0.04
-   * fee safety    = 20%
-   * sponsor extra = 0.01
-   *
-   * total funded ~= 0.058 ASTR
-   */
   sponsorExtraAstr: process.env.SPONSOR_EXTRA_ASTR || "0.01",
-
-  /*
-   * Prevent accidental huge sponsor transfers.
-   */
   maxSponsorFundingAstr: process.env.MAX_SPONSOR_FUNDING_ASTR || "1",
 };
 
@@ -76,42 +39,21 @@ const CONFIG = {
 
 let api = null;
 let provider = null;
-
 let execPair = null;
 let sponsorPair = null;
-
 let unsubscribeAccount = null;
 let unsubscribeHeads = null;
-
 let reconnecting = false;
 let shuttingDown = false;
-
 let sweepInProgress = false;
 let operationInProgress = false;
 let cooldownProcessing = false;
-
 let unlockInitiated = false;
 let withdrawalCompleted = false;
-
 let reconnectGeneration = 0;
 
-/*
- * Generic protected gas.
- *
- * This is used for:
- *
- *   sponsor -> exec funding
- *   claim
- *   unstake
- *   unlock
- *   withdraw
- *
- * The balance watcher will NEVER sweep this amount.
- */
 let protectedOperationGas = 0n;
-
 let protectedOperationLabel = null;
-
 let dappTx = null;
 let dappQuery = null;
 
@@ -126,17 +68,12 @@ function log(level, message, data = undefined) {
     message,
   };
 
-  if (data !== undefined) {
-    record.data = data;
-  }
-
+  if (data !== undefined) record.data = data;
   console.log(JSON.stringify(record));
 }
 
 const info = (message, data) => log("INFO", message, data);
-
 const warn = (message, data) => log("WARN", message, data);
-
 const error = (message, data) => log("ERROR", message, data);
 
 /* -------------------------------------------------------------------------- */
@@ -144,20 +81,12 @@ const error = (message, data) => log("ERROR", message, data);
 /* -------------------------------------------------------------------------- */
 
 function sleep(ms) {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function toBigInt(value) {
-  if (typeof value === "bigint") {
-    return value;
-  }
-
-  if (value && typeof value.toBigInt === "function") {
-    return value.toBigInt();
-  }
-
+  if (typeof value === "bigint") return value;
+  if (value && typeof value.toBigInt === "function") return value.toBigInt();
   return BigInt(value.toString());
 }
 
@@ -165,17 +94,13 @@ const UNIT = 10n ** 18n;
 
 function astr(value) {
   const n = toBigInt(value);
-
   const whole = n / UNIT;
-
   const fraction = (n % UNIT).toString().padStart(18, "0").replace(/0+$/, "");
-
   return fraction ? `${whole}.${fraction}` : whole.toString();
 }
 
 function parseAstr(value) {
   const stringValue = String(value);
-
   const [whole, fraction = ""] = stringValue.split(".");
 
   if (!/^\d+$/.test(whole)) {
@@ -191,7 +116,6 @@ function parseAstr(value) {
   }
 
   const normalizedFraction = (fraction + "0".repeat(18)).slice(0, 18);
-
   return BigInt(whole) * UNIT + BigInt(normalizedFraction);
 }
 
@@ -217,7 +141,6 @@ function minBigInt(a, b) {
 
 function isFeeError(err) {
   const message = String(err?.message || err || "");
-
   return (
     message.includes("1010") ||
     message.includes("Inability to pay some fees") ||
@@ -242,12 +165,9 @@ async function retry(label, fn) {
         error: formatError(err),
       });
 
-      if (attempt === CONFIG.rpcMaxRetries) {
-        throw err;
-      }
+      if (attempt === CONFIG.rpcMaxRetries) throw err;
 
       await sleep(delay);
-
       delay = Math.min(delay * 2, CONFIG.rpcRetryMaxDelayMs);
     }
   }
@@ -268,7 +188,6 @@ async function initializeAccounts() {
   });
 
   const hasExecMnemonic = Boolean(CONFIG.execMnemonic);
-
   const hasExecPrivateKey = Boolean(CONFIG.execPrivateKey);
 
   if (hasExecMnemonic === hasExecPrivateKey) {
@@ -276,7 +195,6 @@ async function initializeAccounts() {
   }
 
   const hasSponsorMnemonic = Boolean(CONFIG.sponsorMnemonic);
-
   const hasSponsorPrivateKey = Boolean(CONFIG.sponsorPrivateKey);
 
   if (hasSponsorMnemonic === hasSponsorPrivateKey) {
@@ -321,11 +239,14 @@ async function initializeAccounts() {
 /* -------------------------------------------------------------------------- */
 
 function verifyRuntime() {
-  if (!api) {
-    throw new Error("API is not initialized");
-  }
+  if (!api) throw new Error("API is not initialized");
 
   const specVersion = api.runtimeVersion.specVersion.toNumber();
+  const specName = api.runtimeVersion.specName.toString().toLowerCase();
+
+  if (specName !== "astar") {
+    throw new Error(`Wrong runtime: expected Astar, got ${specName}`);
+  }
 
   if (specVersion !== CONFIG.expectedSpecVersion) {
     throw new Error(
@@ -369,24 +290,55 @@ function verifyRuntime() {
   dappTx = api.tx.dappStaking;
   dappQuery = api.query.dappStaking;
 
+  const callArguments = {};
+
+  for (const call of requiredCalls) {
+    callArguments[call] = (dappTx[call].meta.args || []).map((arg) => ({
+      name: arg.name.toString(),
+      type: arg.type.toString(),
+    }));
+  }
+
   info("Astar runtime verified", {
+    specName: api.runtimeVersion.specName.toString(),
     specVersion,
-
     pallet: "dappStaking",
-
-    calls: {
-      claimStakerRewards: true,
-      unstake: true,
-      unlock: true,
-      withdrawUnbonded: true,
-    },
-
+    calls: callArguments,
     storage: {
       ledger: true,
       stakerInfo: true,
       activeProtocolState: true,
     },
   });
+
+  const unstakeArgs = callArguments.unstake;
+  const unlockArgs = callArguments.unlock;
+
+  if (unstakeArgs.length < 1 || unstakeArgs.length > 2) {
+    throw new Error(
+      `Unexpected dappStaking.unstake signature: ${unstakeArgs.map((arg) => arg.name).join(", ")}`,
+    );
+  }
+
+  if (unlockArgs.length !== 1) {
+    throw new Error(
+      `Unexpected dappStaking.unlock signature: ${unlockArgs.map((arg) => arg.name).join(", ")}`,
+    );
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* AccountId normalization                                                    */
+/* -------------------------------------------------------------------------- */
+
+function getExecAccountId() {
+  if (!api || !execPair) {
+    throw new Error(
+      "API and exec account must be initialized before querying dApp staking",
+    );
+  }
+
+  return api.createType("AccountId32", execPair.address);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -398,7 +350,6 @@ async function disconnectCurrent() {
     try {
       unsubscribeAccount();
     } catch {}
-
     unsubscribeAccount = null;
   }
 
@@ -406,7 +357,6 @@ async function disconnectCurrent() {
     try {
       unsubscribeHeads();
     } catch {}
-
     unsubscribeHeads = null;
   }
 
@@ -422,7 +372,6 @@ async function disconnectCurrent() {
 
 async function connect() {
   const generation = ++reconnectGeneration;
-
   await disconnectCurrent();
 
   provider = new WsProvider(CONFIG.wss, 10_000);
@@ -490,9 +439,7 @@ function extractFrozenAmount(data) {
     }
   }
 
-  if (candidates.length === 0) {
-    return 0n;
-  }
+  if (candidates.length === 0) return 0n;
 
   return candidates.reduce(
     (highest, value) => (value > highest ? value : highest),
@@ -503,15 +450,10 @@ function extractFrozenAmount(data) {
 async function getAccountState(address) {
   return retry("system.account state", async () => {
     const account = await api.query.system.account(address);
-
     const data = account.data;
-
     const free = toBigInt(data.free);
-
     const reserved = data.reserved !== undefined ? toBigInt(data.reserved) : 0n;
-
     const frozen = extractFrozenAmount(data);
-
     const transferable = free > frozen ? free - frozen : 0n;
 
     return {
@@ -528,7 +470,6 @@ async function getAccountState(address) {
 
 async function getFreeBalance(address) {
   const state = await getAccountState(address);
-
   return state.free;
 }
 
@@ -542,10 +483,7 @@ async function submitFinalized(tx, signer, label) {
     let finished = false;
 
     const fail = (err) => {
-      if (finished) {
-        return;
-      }
-
+      if (finished) return;
       finished = true;
 
       if (unsubscribe) {
@@ -559,9 +497,7 @@ async function submitFinalized(tx, signer, label) {
 
     try {
       unsubscribe = await tx.signAndSend(signer, (result) => {
-        if (finished) {
-          return;
-        }
+        if (finished) return;
 
         if (result.status.isInBlock) {
           info(`${label}: included`, {
@@ -571,7 +507,6 @@ async function submitFinalized(tx, signer, label) {
 
         if (result.dispatchError) {
           let message = result.dispatchError.toString();
-
           let section = null;
           let method = null;
 
@@ -581,27 +516,42 @@ async function submitFinalized(tx, signer, label) {
             );
 
             section = decoded.section;
-
             method = decoded.name;
-
-            message = `${decoded.section}.${decoded.name}: ${decoded.docs.join(
-              " ",
-            )}`;
+            message = `${decoded.section}.${decoded.name}: ${decoded.docs.join(" ")}`;
           }
 
           const err = new Error(`${label} failed: ${message}`);
-
           err.dispatchError = result.dispatchError;
-
           err.dispatchSection = section;
-
           err.dispatchMethod = method;
-
           err.includedBlock = result.status.isInBlock
             ? result.status.asInBlock.toHex()
             : null;
 
           fail(err);
+          return;
+        }
+
+        if (
+          result.status.isDropped ||
+          result.status.isInvalid ||
+          result.status.isUsurped ||
+          result.status.isRetracted ||
+          result.status.isFinalityTimeout
+        ) {
+          const statusName = [
+            "Dropped",
+            "Invalid",
+            "Usurped",
+            "Retracted",
+            "FinalityTimeout",
+          ].find((name) => result.status[`is${name}`]);
+
+          fail(
+            new Error(
+              `${label} transaction status: ${statusName || result.status.type}`,
+            ),
+          );
 
           return;
         }
@@ -635,7 +585,6 @@ async function submitFinalized(tx, signer, label) {
 async function estimateFee(tx, signer) {
   return retry("paymentInfo", async () => {
     const result = await tx.paymentInfo(signer);
-
     return toBigInt(result.partialFee);
   });
 }
@@ -650,11 +599,8 @@ function addFeeSafety(fee) {
 
 async function getFeeRequirement(tx, signer) {
   const account = await getAccountState(signer.address);
-
   const estimatedFee = await estimateFee(tx, signer);
-
   const feeWithSafety = addFeeSafety(estimatedFee);
-
   const reserve = parseAstr(CONFIG.minRemainingAstr);
 
   const protectedGas =
@@ -681,26 +627,19 @@ async function getFeeRequirement(tx, signer) {
 /* -------------------------------------------------------------------------- */
 
 async function sponsorFundExec(requiredAmount, reason) {
-  if (requiredAmount <= 0n) {
-    return 0n;
-  }
+  if (requiredAmount <= 0n) return 0n;
 
   const extra = parseAstr(CONFIG.sponsorExtraAstr);
-
-  let funding = requiredAmount + extra;
-
+  const funding = requiredAmount + extra;
   const maximum = parseAstr(CONFIG.maxSponsorFundingAstr);
 
   if (funding > maximum) {
     throw new Error(
-      `Sponsor funding request ${astr(
-        funding,
-      )} exceeds MAX_SPONSOR_FUNDING_ASTR=${CONFIG.maxSponsorFundingAstr}`,
+      `Sponsor funding request ${astr(funding)} exceeds MAX_SPONSOR_FUNDING_ASTR=${CONFIG.maxSponsorFundingAstr}`,
     );
   }
 
   const sponsorState = await getAccountState(sponsorPair.address);
-
   const sponsorReserve = parseAstr(CONFIG.minRemainingAstr);
 
   const sponsorAvailable =
@@ -708,49 +647,31 @@ async function sponsorFundExec(requiredAmount, reason) {
       ? sponsorState.transferable - sponsorReserve
       : 0n;
 
-  /*
-   * Estimate the sponsor transfer itself.
-   *
-   * The sponsor also has to pay the transfer fee.
-   */
-  let transferTx = api.tx.balances.transferKeepAlive(execPair.address, funding);
+  const transferTx = api.tx.balances.transferKeepAlive(
+    execPair.address,
+    funding,
+  );
 
   const transferFee = await estimateFee(transferTx, sponsorPair);
-
   const sponsorRequired = funding + addFeeSafety(transferFee);
 
   if (sponsorAvailable < sponsorRequired) {
     throw new Error(
-      `Sponsor cannot fund exec. Required ${astr(
-        sponsorRequired,
-      )} ASTR, available ${astr(sponsorAvailable)} ASTR`,
+      `Sponsor cannot fund exec. Required ${astr(sponsorRequired)} ASTR, available ${astr(sponsorAvailable)} ASTR`,
     );
   }
 
   info("Funding exec transaction gas", {
     reason,
-
     required: astr(requiredAmount),
-
     extraSafety: astr(extra),
-
     funding: astr(funding),
-
     sponsorTransferFee: astr(transferFee),
-
     sponsorRequired: astr(sponsorRequired),
-
     sponsorAvailable: astr(sponsorAvailable),
   });
 
-  /*
-   * Protect BEFORE broadcasting.
-   *
-   * This prevents the balance watcher from
-   * sweeping the newly funded ASTR.
-   */
   protectedOperationGas = funding;
-
   protectedOperationLabel = reason;
 
   try {
@@ -762,12 +683,6 @@ async function sponsorFundExec(requiredAmount, reason) {
 
     return funding;
   } catch (err) {
-    /*
-     * Do not remove protection on failure.
-     *
-     * The funding may have been included even
-     * if the callback encountered an RPC issue.
-     */
     throw err;
   }
 }
@@ -786,37 +701,21 @@ async function submitExecOperation(txFactory, label) {
   operationInProgress = true;
 
   try {
-    /*
-     * Build transaction before funding.
-     */
     let tx = txFactory();
-
     let requirement = await getFeeRequirement(tx, execPair);
 
     info("Exec fee check", {
       label,
-
       transferable: astr(requirement.account.transferable),
-
       frozen: astr(requirement.account.frozen),
-
       reserve: astr(requirement.reserve),
-
       protectedGas: astr(requirement.protectedGas),
-
       estimatedFee: astr(requirement.estimatedFee),
-
       feeWithSafety: astr(requirement.feeWithSafety),
-
       available: astr(requirement.available),
-
       canAfford: requirement.canAfford,
     });
 
-    /*
-     * If exec cannot pay, sponsor funds
-     * the shortfall.
-     */
     if (!requirement.canAfford) {
       const shortfall =
         requirement.feeWithSafety > requirement.available
@@ -825,44 +724,23 @@ async function submitExecOperation(txFactory, label) {
 
       await sponsorFundExec(shortfall, label);
 
-      /*
-       * Rebuild the transaction after
-       * sponsor funding.
-       */
       tx = txFactory();
-
       requirement = await getFeeRequirement(tx, execPair);
 
       if (!requirement.canAfford) {
         throw new Error(
-          `Exec still cannot afford ${label} after sponsor funding. Available ${astr(
-            requirement.available,
-          )}, required ${astr(requirement.feeWithSafety)}`,
+          `Exec still cannot afford ${label} after sponsor funding. Available ${astr(requirement.available)}, required ${astr(requirement.feeWithSafety)}`,
         );
       }
     }
 
-    /*
-     * Transaction can now safely be submitted.
-     */
     await submitFinalized(tx, execPair, label);
 
-    /*
-     * Operation succeeded.
-     *
-     * Any sponsor-funded gas that remains
-     * is now ordinary exec balance and can
-     * be swept.
-     */
     protectedOperationGas = 0n;
     protectedOperationLabel = null;
 
     return true;
   } catch (err) {
-    /*
-     * Keep sponsor-funded gas protected so
-     * a later retry can use it.
-     */
     if (protectedOperationGas > 0n) {
       warn("Exec operation failed; funded gas remains protected", {
         label,
@@ -887,7 +765,6 @@ async function transfer(signer, destination, amount, label) {
   }
 
   const tx = api.tx.balances.transferKeepAlive(destination, amount);
-
   return submitFinalized(tx, signer, label);
 }
 
@@ -910,16 +787,10 @@ function calculateSweepAmount({
   fee,
   protectedGas = 0n,
 }) {
-  /*
-   * Frozen balance is untouchable.
-   *
-   * We also protect:
-   *
-   *   - configured reserve
-   *   - operation gas
-   *   - transaction fee
-   */
-  const protectedBalance = maxBigInt(maxBigInt(reserve, frozen), protectedGas);
+  const protectedBalance = maxBigInt(
+    maxBigInt(reserve, frozen),
+    protectedGas,
+  );
 
   const feeWithSafety = addFeeSafety(fee);
 
@@ -942,13 +813,11 @@ function calculateSweepAmount({
 async function sweep(reason) {
   if (sweepInProgress) {
     info("Sweep skipped: another sweep is running");
-
     return false;
   }
 
   if (operationInProgress) {
     info("Sweep skipped: exec operation is active");
-
     return false;
   }
 
@@ -956,7 +825,6 @@ async function sweep(reason) {
 
   try {
     const reserve = parseAstr(CONFIG.minRemainingAstr);
-
     let account = await getAccountState(execPair.address);
 
     info("Sweep account state", {
@@ -987,13 +855,8 @@ async function sweep(reason) {
       return false;
     }
 
-    /*
-     * First fee estimate.
-     */
     const candidate = account.free - protectedBalance;
-
     let feeTx = api.tx.balances.transferKeepAlive(CONFIG.vault, candidate);
-
     const estimatedFee = await estimateFee(feeTx, execPair);
 
     let calculation = calculateSweepAmount({
@@ -1015,10 +878,10 @@ async function sweep(reason) {
       return false;
     }
 
-    /*
-     * Re-estimate using actual amount.
-     */
-    feeTx = api.tx.balances.transferKeepAlive(CONFIG.vault, calculation.amount);
+    feeTx = api.tx.balances.transferKeepAlive(
+      CONFIG.vault,
+      calculation.amount,
+    );
 
     const finalEstimatedFee = await estimateFee(feeTx, execPair);
 
@@ -1045,23 +908,14 @@ async function sweep(reason) {
 
     info("Submitting sweep", {
       amount: astr(amount),
-
       estimatedFee: astr(finalEstimatedFee),
-
       feeWithSafety: astr(calculation.feeWithSafety),
-
       frozen: astr(account.frozen),
-
       reserve: astr(reserve),
-
       protectedOperationGas: astr(protectedOperationGas),
-
       protectedOperationLabel,
-
       protectedBalance: astr(calculation.protectedBalance),
-
       reason,
-
       vault: CONFIG.vault,
     });
 
@@ -1086,9 +940,6 @@ async function sweep(reason) {
         return false;
       }
 
-      /*
-       * Frozen is recoverable.
-       */
       warn("Sweep rejected by Frozen protection; refreshing account", {
         error: formatError(err),
       });
@@ -1136,7 +987,6 @@ async function sweep(reason) {
 
       if (retryCalculation.amount <= 0n) {
         warn("Frozen recovery leaves no sweepable amount");
-
         return false;
       }
 
@@ -1182,20 +1032,15 @@ async function sweep(reason) {
 
 async function getStakerPositions() {
   return retry("dApp stakerInfo entries", async () => {
-    const entries = await dappQuery.stakerInfo.entries(execPair.address);
-
+    const accountId = getExecAccountId();
+    const entries = await dappQuery.stakerInfo.entries(accountId);
     const positions = [];
 
     for (const [key, value] of entries) {
-      if (!value || value.isNone) {
-        continue;
-      }
+      if (!value || value.isNone) continue;
 
       const args = key.args;
-
-      if (!args || args.length < 2) {
-        continue;
-      }
+      if (!args || args.length < 2) continue;
 
       const dapp = args[args.length - 1];
 
@@ -1218,9 +1063,7 @@ async function getStakerPositions() {
 function extractStakeAmount(codec) {
   const json = codecToJson(codec);
 
-  if (!json || typeof json !== "object") {
-    return 0n;
-  }
+  if (!json || typeof json !== "object") return 0n;
 
   const stakeObject =
     json.staked ?? json.stake ?? json.stakeAmount ?? json.stake_amount;
@@ -1229,26 +1072,23 @@ function extractStakeAmount(codec) {
     let total = 0n;
 
     const voting = stakeObject.voting;
+    const buildAndEarn =
+      stakeObject.buildAndEarn ?? stakeObject.build_and_earn;
 
-    const buildAndEarn = stakeObject.buildAndEarn ?? stakeObject.build_and_earn;
-
-    if (voting !== undefined) {
-      total += toBigInt(voting);
-    }
-
-    if (buildAndEarn !== undefined) {
-      total += toBigInt(buildAndEarn);
-    }
+    if (voting !== undefined) total += toBigInt(voting);
+    if (buildAndEarn !== undefined) total += toBigInt(buildAndEarn);
 
     return total;
   }
 
-  const directCandidates = [json.amount, json.stakedAmount, json.staked_amount];
+  const directCandidates = [
+    json.amount,
+    json.stakedAmount,
+    json.staked_amount,
+  ];
 
   for (const value of directCandidates) {
-    if (value === undefined || value === null) {
-      continue;
-    }
+    if (value === undefined || value === null) continue;
 
     try {
       return toBigInt(value);
@@ -1269,7 +1109,6 @@ async function claimStakerRewards() {
 
   if (positions.length === 0) {
     info("No dApp staking positions; skipping reward claim");
-
     return false;
   }
 
@@ -1280,7 +1119,6 @@ async function claimStakerRewards() {
     );
 
     info("dApp staking rewards claimed successfully");
-
     return true;
   } catch (err) {
     const message = String(err?.message || err);
@@ -1290,7 +1128,6 @@ async function claimStakerRewards() {
       message.includes("No claimable rewards")
     ) {
       info("No claimable dApp staking rewards");
-
       return false;
     }
 
@@ -1310,6 +1147,22 @@ async function claimStakerRewards() {
 /* Unstake one position                                                       */
 /* -------------------------------------------------------------------------- */
 
+function buildUnstakeTx(dapp, amount) {
+  const args = dappTx.unstake.meta.args || [];
+
+  if (args.length === 1) {
+    return dappTx.unstake(dapp);
+  }
+
+  if (args.length === 2) {
+    return dappTx.unstake(dapp, amount.toString());
+  }
+
+  throw new Error(
+    `Unsupported dappStaking.unstake signature: ${args.map((arg) => arg.name).join(", ")}`,
+  );
+}
+
 async function unstakePosition(position) {
   const amount = extractStakeAmount(position.codec);
 
@@ -1328,7 +1181,7 @@ async function unstakePosition(position) {
 
   try {
     await submitExecOperation(
-      () => dappTx.unstake(position.dapp, amount),
+      () => buildUnstakeTx(position.dapp, amount),
       `Unstake ${astr(amount)} ASTR`,
     );
 
@@ -1365,22 +1218,16 @@ async function unstakePosition(position) {
       }
 
       const updatedAmount = extractStakeAmount(updated.codec);
-
-      if (updatedAmount <= 0n) {
-        return false;
-      }
+      if (updatedAmount <= 0n) return false;
 
       await submitExecOperation(
-        () => dappTx.unstake(updated.dapp, updatedAmount),
+        () => buildUnstakeTx(updated.dapp, updatedAmount),
         `Retry unstake ${astr(updatedAmount)} ASTR`,
       );
 
       return true;
     }
 
-    /*
-     * Fee errors are recoverable.
-     */
     if (isFeeError(err)) {
       warn("Unstake could not pay fees; sponsor funding/retry will handle it", {
         dapp: position.dapp.toString(),
@@ -1401,44 +1248,23 @@ async function unstakePosition(position) {
 async function phase1UnstakeAll() {
   info("PHASE 1A START: claim rewards + unstake");
 
-  /*
-   * Query positions FIRST.
-   *
-   * This avoids the useless claim transaction
-   * when there are no positions.
-   */
   let positions = await getStakerPositions();
 
   info("dApp staking positions discovered", {
     count: positions.length,
-
     positions: positions.map((position) => ({
       dapp: position.dapp.toString(),
-
       data: position.human,
-
       stake: astr(extractStakeAmount(position.codec)),
     })),
   });
 
   if (positions.length === 0) {
     info("No dApp positions found");
-
     return;
   }
 
-  /*
-   * Claim before unstaking.
-   *
-   * If there are insufficient funds,
-   * submitExecOperation() automatically
-   * asks the sponsor for gas.
-   */
   await claimStakerRewards();
-
-  /*
-   * Refresh positions after claiming.
-   */
   positions = await getStakerPositions();
 
   for (const position of positions) {
@@ -1455,7 +1281,6 @@ async function phase1UnstakeAll() {
     if (amount > 0n) {
       remaining.push({
         dapp: position.dapp.toString(),
-
         amount: astr(amount),
       });
     }
@@ -1463,9 +1288,7 @@ async function phase1UnstakeAll() {
 
   if (remaining.length > 0) {
     throw new Error(
-      `Active dApp stake remains after unstake phase: ${JSON.stringify(
-        remaining,
-      )}`,
+      `Active dApp stake remains after unstake phase: ${JSON.stringify(remaining)}`,
     );
   }
 
@@ -1477,7 +1300,10 @@ async function phase1UnstakeAll() {
 /* -------------------------------------------------------------------------- */
 
 async function getLedger() {
-  return retry("dApp staking ledger", () => dappQuery.ledger(execPair.address));
+  return retry("dApp staking ledger", async () => {
+    const accountId = getExecAccountId();
+    return dappQuery.ledger(accountId);
+  });
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1487,19 +1313,16 @@ async function getLedger() {
 function getUnlockingChunks(ledger) {
   const json = codecToJson(ledger);
 
-  if (!json || typeof json !== "object") {
-    return [];
-  }
+  if (!json || typeof json !== "object") return [];
 
-  const chunks = json.unlocking ?? json.unlockingChunks ?? json.unbonding ?? [];
+  const chunks =
+    json.unlocking ?? json.unlockingChunks ?? json.unbonding ?? [];
 
   return Array.isArray(chunks) ? chunks : [];
 }
 
 function getChunkUnlockBlock(chunk) {
-  if (chunk === null || typeof chunk !== "object") {
-    return null;
-  }
+  if (chunk === null || typeof chunk !== "object") return null;
 
   const candidates = [
     chunk.unlockBlock,
@@ -1510,9 +1333,7 @@ function getChunkUnlockBlock(chunk) {
   ];
 
   for (const value of candidates) {
-    if (value === undefined || value === null) {
-      continue;
-    }
+    if (value === undefined || value === null) continue;
 
     try {
       return BigInt(value);
@@ -1526,7 +1347,6 @@ function describeChunk(chunk) {
   return {
     amount:
       chunk.amount !== undefined ? astr(toBigInt(chunk.amount)) : undefined,
-
     unlockBlock: getChunkUnlockBlock(chunk)?.toString() ?? null,
   };
 }
@@ -1540,54 +1360,37 @@ async function phase1UnlockAll() {
 
   const ledger = await getLedger();
 
-  if (!ledger) {
-    throw new Error("Unable to read dApp staking ledger");
-  }
+  if (!ledger) throw new Error("Unable to read dApp staking ledger");
 
   const json = codecToJson(ledger);
 
   if (!json || json.locked === undefined || json.locked === null) {
     throw new Error(
-      "Runtime 2400 ledger does not expose a readable locked balance",
+      "Astar runtime ledger does not expose a readable locked balance",
     );
   }
 
   const locked = toBigInt(json.locked);
-
   const unlockingChunks = getUnlockingChunks(ledger);
 
-  if (unlockingChunks.length > 0) {
-    unlockInitiated = true;
-  }
+  if (unlockingChunks.length > 0) unlockInitiated = true;
 
   info("Current dApp staking ledger", {
     locked: astr(locked),
-
     unlockingChunks: unlockingChunks.length,
-
     unlocking: unlockingChunks.map(describeChunk),
   });
 
   if (locked <= 0n) {
     info("No locked ASTR remains to unlock");
-
     return false;
   }
 
-  /*
-   * Runtime 2400 unlock expects
-   * Compact<u128>.
-   *
-   * Therefore we pass the actual
-   * ledger locked value.
-   */
   const amountToUnlock = locked;
 
   info("Preparing dApp staking unlock", {
     amount: astr(amountToUnlock),
-
     rawAmount: amountToUnlock.toString(),
-
     bitLength: amountToUnlock.toString(2).length,
   });
 
@@ -1637,9 +1440,7 @@ async function phase1UnlockAll() {
 
 async function phase1Unstake() {
   await phase1UnstakeAll();
-
   await sleep(500);
-
   await phase1UnlockAll();
 }
 
@@ -1649,9 +1450,7 @@ async function phase1Unstake() {
 
 async function phase2ImmediateSweep() {
   info("PHASE 2 START: sweeping transferable ASTR");
-
   await sweep("post-unlock");
-
   info("PHASE 2 COMPLETE");
 }
 
@@ -1671,42 +1470,24 @@ async function startBalanceWatcher() {
   unsubscribeAccount = await api.query.system.account(
     execPair.address,
     async (account) => {
-      if (operationInProgress || sweepInProgress) {
-        return;
-      }
+      if (operationInProgress || sweepInProgress) return;
 
       try {
         const free = toBigInt(account.data.free);
-
         const frozen = extractFrozenAmount(account.data);
-
         const transferable = free > frozen ? free - frozen : 0n;
-
         const reserve = parseAstr(CONFIG.minRemainingAstr);
 
         info("Exec balance changed", {
           free: astr(free),
-
           frozen: astr(frozen),
-
           transferable: astr(transferable),
-
           protectedOperationGas: astr(protectedOperationGas),
-
           protectedOperationLabel,
         });
 
-        /*
-         * Retry a pending unlock if:
-         *
-         *   - no unlock has started
-         *   - there is locked ASTR
-         *   - the account now has some
-         *     usable balance
-         */
         if (!unlockInitiated) {
           const ledger = await getLedger();
-
           const json = codecToJson(ledger);
 
           const locked =
@@ -1716,10 +1497,7 @@ async function startBalanceWatcher() {
 
           if (locked > 0n) {
             await phase1UnlockAll();
-
-            if (unlockInitiated) {
-              return;
-            }
+            if (unlockInitiated) return;
           }
         }
 
@@ -1759,7 +1537,6 @@ async function getCurrentFinalizedBlock() {
 
 async function getUnlockStatus(finalizedBlock = null) {
   const ledger = await getLedger();
-
   const chunks = getUnlockingChunks(ledger);
 
   if (chunks.length === 0) {
@@ -1771,21 +1548,18 @@ async function getUnlockStatus(finalizedBlock = null) {
     };
   }
 
-  const currentBlock = finalizedBlock ?? (await getCurrentFinalizedBlock());
+  const currentBlock =
+    finalizedBlock ?? (await getCurrentFinalizedBlock());
 
   const maturedChunks = chunks.filter((chunk) => {
     const unlockBlock = getChunkUnlockBlock(chunk);
-
     return unlockBlock !== null && currentBlock >= unlockBlock;
   });
 
   return {
     matured: maturedChunks.length > 0,
-
     chunks,
-
     maturedChunks,
-
     finalizedBlock: currentBlock,
   };
 }
@@ -1795,23 +1569,17 @@ async function getUnlockStatus(finalizedBlock = null) {
 /* -------------------------------------------------------------------------- */
 
 async function phase5Withdraw() {
-  if (operationInProgress || shuttingDown) {
-    return false;
-  }
+  if (operationInProgress || shuttingDown) return false;
 
   const before = await getUnlockStatus();
 
   if (before.chunks.length === 0) {
     withdrawalCompleted = true;
-
     info("No unlocking chunks remain");
-
     return false;
   }
 
-  if (!before.matured) {
-    return false;
-  }
+  if (!before.matured) return false;
 
   try {
     info("PHASE 5 START: withdrawing matured ASTR", {
@@ -1835,12 +1603,10 @@ async function phase5Withdraw() {
   await sweep("post-withdrawal");
 
   const ledger = await getLedger();
-
   const remainingChunks = getUnlockingChunks(ledger);
 
   if (remainingChunks.length === 0) {
     withdrawalCompleted = true;
-
     info("PHASE 5 COMPLETE: all unlocking chunks have been withdrawn");
   } else {
     withdrawalCompleted = false;
@@ -1849,7 +1615,6 @@ async function phase5Withdraw() {
       "PHASE 5 COMPLETE: matured chunks withdrawn; remaining chunks still waiting",
       {
         remainingChunks: remainingChunks.length,
-
         chunks: remainingChunks.map(describeChunk),
       },
     );
@@ -1863,17 +1628,10 @@ async function phase5Withdraw() {
 /* -------------------------------------------------------------------------- */
 
 async function processCooldown(finalizedBlock) {
-  if (operationInProgress || shuttingDown) {
-    return;
-  }
+  if (operationInProgress || shuttingDown) return;
 
-  /*
-   * If unlock has not happened yet,
-   * keep checking the ledger.
-   */
   if (!unlockInitiated) {
     const ledger = await getLedger();
-
     const json = codecToJson(ledger);
 
     const locked =
@@ -1896,16 +1654,13 @@ async function processCooldown(finalizedBlock) {
 
   info("Unlocking status", {
     block: finalizedBlock.toString(),
-
     chunks: status.chunks.length,
-
     maturedChunks: status.maturedChunks.length,
   });
 
   if (status.chunks.length === 0) {
     if (unlockInitiated && !withdrawalCompleted) {
       withdrawalCompleted = true;
-
       info("All dApp staking unlocking chunks have been withdrawn");
     }
 
@@ -1913,10 +1668,7 @@ async function processCooldown(finalizedBlock) {
   }
 
   withdrawalCompleted = false;
-
-  if (!status.matured) {
-    return;
-  }
+  if (!status.matured) return;
 
   info("Unlocking chunk(s) matured", {
     maturedChunks: status.maturedChunks.map(describeChunk),
@@ -1942,15 +1694,12 @@ async function phase4CooldownWatcher() {
 
   unsubscribeHeads = await api.rpc.chain.subscribeFinalizedHeads(
     async (header) => {
-      if (cooldownProcessing || shuttingDown) {
-        return;
-      }
+      if (cooldownProcessing || shuttingDown) return;
 
       cooldownProcessing = true;
 
       try {
         const finalizedBlock = toBigInt(header.number);
-
         await processCooldown(finalizedBlock);
       } catch (err) {
         error("Cooldown watcher error", {
@@ -1964,13 +1713,8 @@ async function phase4CooldownWatcher() {
 
   info("Phase 4 cooldown watcher active");
 
-  /*
-   * Process immediately instead
-   * of waiting for the next block.
-   */
   try {
     const currentBlock = await getCurrentFinalizedBlock();
-
     await processCooldown(currentBlock);
   } catch (err) {
     error("Initial cooldown check failed", {
@@ -1984,9 +1728,7 @@ async function phase4CooldownWatcher() {
 /* -------------------------------------------------------------------------- */
 
 async function reconnect() {
-  if (reconnecting || shuttingDown) {
-    return;
-  }
+  if (reconnecting || shuttingDown) return;
 
   reconnecting = true;
 
@@ -1998,23 +1740,18 @@ async function reconnect() {
         info("Attempting Astar WebSocket reconnect");
 
         await connect();
-
         await startBalanceWatcher();
-
         await phase4CooldownWatcher();
 
         info("Astar WebSocket reconnected");
-
         return;
       } catch (err) {
         warn("Reconnect failed", {
           error: formatError(err),
-
           retryInMs: delay,
         });
 
         await sleep(delay);
-
         delay = Math.min(delay * 2, CONFIG.reconnectMaxDelayMs);
       }
     }
@@ -2029,43 +1766,27 @@ async function reconnect() {
 
 async function main() {
   info("================================================");
-
-  info("ASTAR NATIVE RUNTIME-2400 UNSTAKE / AUTO-SWEEP BOT");
-
+  info(
+    `ASTAR NATIVE RUNTIME-${CONFIG.expectedSpecVersion} UNSTAKE / AUTO-SWEEP BOT`,
+  );
   info("================================================");
 
   await initializeAccounts();
-
   await connect();
 
   const initialState = await getAccountState(execPair.address);
 
   info("Initial exec account state", {
     address: execPair.address,
-
     free: astr(initialState.free),
-
     reserved: astr(initialState.reserved),
-
     frozen: astr(initialState.frozen),
-
     transferable: astr(initialState.transferable),
   });
 
-  /*
-   * Start watchers BEFORE phase processing.
-   *
-   * This means that even if an initial operation
-   * fails, the bot is already alive and can react
-   * to later balance/block changes.
-   */
   await startBalanceWatcher();
-
   await phase4CooldownWatcher();
 
-  /*
-   * Initial dApp processing.
-   */
   try {
     await phase1Unstake();
   } catch (err) {
@@ -2092,12 +1813,9 @@ async function main() {
 /* -------------------------------------------------------------------------- */
 
 async function shutdown(signal) {
-  if (shuttingDown) {
-    return;
-  }
+  if (shuttingDown) return;
 
   shuttingDown = true;
-
   info(`Received ${signal}; shutting down`);
 
   if (unsubscribeAccount) {
@@ -2130,7 +1848,6 @@ async function shutdown(signal) {
 /* -------------------------------------------------------------------------- */
 
 process.on("SIGINT", () => shutdown("SIGINT"));
-
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 process.on("uncaughtException", (err) => {
