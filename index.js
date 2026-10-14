@@ -824,196 +824,125 @@ async function sweep(reason) {
   sweepInProgress = true;
 
   try {
-    const reserve = parseAstr(CONFIG.minRemainingAstr);
-    let account = await getAccountState(execPair.address);
+    // Exactly 0.009 ASTR in planck.
+    const transferAmount = 9_000_000_000_000_000n;
+    const account = await getAccountState(execPair.address);
 
     info("Sweep account state", {
-      free: astr(account.free),
-      reserved: astr(account.reserved),
-      frozen: astr(account.frozen),
-      transferable: astr(account.transferable),
-      reserve: astr(reserve),
-      protectedOperationGas: astr(protectedOperationGas),
+      freePlanck: account.free.toString(),
+      freeAstr: astr(account.free),
+      frozenPlanck: account.frozen.toString(),
+      frozenAstr: astr(account.frozen),
+      transferableBalancePlanck: account.transferable.toString(),
+      transferableBalanceAstr: astr(account.transferable),
+      transferAmountPlanck: transferAmount.toString(),
+      transferAmountAstr: astr(transferAmount),
+      protectedOperationGasPlanck:
+        protectedOperationGas.toString(),
+      protectedOperationGasAstr: astr(protectedOperationGas),
       protectedOperationLabel,
-      reason,
-    });
-
-    const protectedBalance = maxBigInt(
-      maxBigInt(reserve, account.frozen),
-      protectedOperationGas,
-    );
-
-    if (account.free <= protectedBalance) {
-      info("Nothing safely sweepable", {
-        free: astr(account.free),
-        frozen: astr(account.frozen),
-        reserve: astr(reserve),
-        protectedOperationGas: astr(protectedOperationGas),
-        protectedBalance: astr(protectedBalance),
-      });
-
-      return false;
-    }
-
-    const candidate = account.free - protectedBalance;
-    let feeTx = api.tx.balances.transferKeepAlive(CONFIG.vault, candidate);
-    const estimatedFee = await estimateFee(feeTx, execPair);
-
-    let calculation = calculateSweepAmount({
-      free: account.free,
-      frozen: account.frozen,
-      reserve,
-      fee: estimatedFee,
-      protectedGas: protectedOperationGas,
-    });
-
-    if (calculation.amount <= 0n) {
-      info("Nothing remains after fee/protection", {
-        free: astr(account.free),
-        frozen: astr(account.frozen),
-        estimatedFee: astr(estimatedFee),
-        protectedBalance: astr(calculation.protectedBalance),
-      });
-
-      return false;
-    }
-
-    feeTx = api.tx.balances.transferKeepAlive(
-      CONFIG.vault,
-      calculation.amount,
-    );
-
-    const finalEstimatedFee = await estimateFee(feeTx, execPair);
-
-    calculation = calculateSweepAmount({
-      free: account.free,
-      frozen: account.frozen,
-      reserve,
-      fee: finalEstimatedFee,
-      protectedGas: protectedOperationGas,
-    });
-
-    if (calculation.amount <= 0n) {
-      info("Final fee calculation leaves nothing sweepable", {
-        free: astr(account.free),
-        frozen: astr(account.frozen),
-        estimatedFee: astr(finalEstimatedFee),
-        protectedBalance: astr(calculation.protectedBalance),
-      });
-
-      return false;
-    }
-
-    const amount = calculation.amount;
-
-    info("Submitting sweep", {
-      amount: astr(amount),
-      estimatedFee: astr(finalEstimatedFee),
-      feeWithSafety: astr(calculation.feeWithSafety),
-      frozen: astr(account.frozen),
-      reserve: astr(reserve),
-      protectedOperationGas: astr(protectedOperationGas),
-      protectedOperationLabel,
-      protectedBalance: astr(calculation.protectedBalance),
       reason,
       vault: CONFIG.vault,
     });
 
-    const tx = api.tx.balances.transferKeepAlive(CONFIG.vault, amount);
-
-    try {
-      await submitFinalized(tx, execPair, `Sweep ${astr(amount)} ASTR`);
-
-      info("Sweep completed", {
-        amount: astr(amount),
-        reason,
-      });
-
-      return true;
-    } catch (err) {
-      if (!isFrozenError(err)) {
-        error("Sweep failed", {
-          reason,
-          error: formatError(err),
-        });
-
-        return false;
-      }
-
-      warn("Sweep rejected by Frozen protection; refreshing account", {
-        error: formatError(err),
-      });
-
-      account = await getAccountState(execPair.address);
-
-      info("Refreshed account after Frozen", {
-        free: astr(account.free),
-        reserved: astr(account.reserved),
-        frozen: astr(account.frozen),
-        transferable: astr(account.transferable),
-      });
-
-      const retryProtected = maxBigInt(
-        maxBigInt(reserve, account.frozen),
-        protectedOperationGas,
+    if (account.transferable <= transferAmount) {
+      warn(
+        "Sweep aborted: transferable balance does not cover the fixed transfer amount",
+        {
+          transferableBalancePlanck:
+            account.transferable.toString(),
+          transferableBalanceAstr: astr(account.transferable),
+          transferAmountPlanck: transferAmount.toString(),
+          transferAmountAstr: astr(transferAmount),
+        },
       );
 
-      if (account.free <= retryProtected) {
-        warn("No balance remains sweepable after Frozen protection", {
-          free: astr(account.free),
-          frozen: astr(account.frozen),
-          protected: astr(retryProtected),
-        });
-
-        return false;
-      }
-
-      const retryCandidate = account.free - retryProtected;
-
-      const retryFeeTx = api.tx.balances.transferKeepAlive(
-        CONFIG.vault,
-        retryCandidate,
-      );
-
-      const retryFee = await estimateFee(retryFeeTx, execPair);
-
-      const retryCalculation = calculateSweepAmount({
-        free: account.free,
-        frozen: account.frozen,
-        reserve,
-        fee: retryFee,
-        protectedGas: protectedOperationGas,
-      });
-
-      if (retryCalculation.amount <= 0n) {
-        warn("Frozen recovery leaves no sweepable amount");
-        return false;
-      }
-
-      info("Retrying sweep with refreshed protection", {
-        amount: astr(retryCalculation.amount),
-        frozen: astr(account.frozen),
-        protected: astr(retryCalculation.protectedBalance),
-      });
-
-      const retryTx = api.tx.balances.transferKeepAlive(
-        CONFIG.vault,
-        retryCalculation.amount,
-      );
-
-      await submitFinalized(
-        retryTx,
-        execPair,
-        `Retry sweep ${astr(retryCalculation.amount)} ASTR`,
-      );
-
-      info("Sweep recovery completed", {
-        amount: astr(retryCalculation.amount),
-        reason,
-      });
-
-      return true;
+      return false;
     }
+
+    // Construct the exact transfer extrinsic.
+    const tx = api.tx.balances.transferKeepAlive(
+      CONFIG.vault,
+      transferAmount.toString(),
+    );
+
+    // Estimate the fee before calculating the tip.
+    const feeInfo = await retry(
+      "transactionPaymentApi.queryInfo",
+      () =>
+        api.call.transactionPaymentApi.queryInfo(
+          tx.toHex(),
+          tx.length,
+        ),
+    );
+
+    const estimatedBaseFee = toBigInt(feeInfo.partialFee);
+
+    // Keep all calculations in planck using BigInt.
+    const tip =
+      account.transferable -
+      transferAmount -
+      estimatedBaseFee;
+
+    if (tip <= 0n) {
+      warn("Sweep aborted: computed tip is zero or negative", {
+        transferableBalancePlanck:
+          account.transferable.toString(),
+        transferAmountPlanck: transferAmount.toString(),
+        estimatedBaseFeePlanck:
+          estimatedBaseFee.toString(),
+        tipPlanck: tip.toString(),
+        reason,
+      });
+
+      return false;
+    }
+
+    // Fetch the next account nonce.
+    const pendingNonce = await retry(
+      "accountNextIndex",
+      () =>
+        api.rpc.system.accountNextIndex(execPair.address),
+    );
+
+    info("Sweep transaction breakdown", {
+      transferableBalancePlanck:
+        account.transferable.toString(),
+      transferableBalanceAstr: astr(account.transferable),
+      transferAmountPlanck: transferAmount.toString(),
+      transferAmountAstr: astr(transferAmount),
+      estimatedBaseFeePlanck:
+        estimatedBaseFee.toString(),
+      estimatedBaseFeeAstr: astr(estimatedBaseFee),
+      tipPlanck: tip.toString(),
+      tipAstr: astr(tip),
+      nonce: pendingNonce.toString(),
+      reason,
+      vault: CONFIG.vault,
+    });
+
+    // Submit and wait for finalization.
+    await submitFinalized(
+      tx,
+      execPair,
+      "Sweep 0.009 ASTR to vault",
+      {
+        nonce: pendingNonce,
+        tip,
+      },
+    );
+
+    info("Sweep completed", {
+      transferAmountPlanck: transferAmount.toString(),
+      transferAmountAstr: astr(transferAmount),
+      tipPlanck: tip.toString(),
+      tipAstr: astr(tip),
+      nonce: pendingNonce.toString(),
+      reason,
+      vault: CONFIG.vault,
+    });
+
+    return true;
   } catch (err) {
     error("Sweep operation encountered an error", {
       reason,
