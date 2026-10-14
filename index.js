@@ -14,6 +14,14 @@ function required(name) {
   return value;
 }
 
+function positiveNumber(name, value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive number`);
+  }
+  return parsed;
+}
+
 const CONFIG = {
   wss: required("ASTAR_WSS"),
   execMnemonic: process.env.EXEC_MNEMONIC,
@@ -21,14 +29,37 @@ const CONFIG = {
   sponsorMnemonic: process.env.SPONSOR_MNEMONIC,
   sponsorPrivateKey: process.env.SPONSOR_PRIVATE_KEY,
   vault: required("VAULT_ADDRESS"),
+
   expectedSpecVersion: Number(process.env.EXPECTED_SPEC_VERSION || "2500"),
-  rpcMaxRetries: Number(process.env.RPC_MAX_RETRIES || "6"),
+  rpcMaxRetries: positiveNumber("RPC_MAX_RETRIES", process.env.RPC_MAX_RETRIES || "6"),
+
   feeSafetyBps: BigInt(process.env.FEE_SAFETY_BPS || "2000"),
   minRemainingAstr: process.env.MIN_REMAINING_ASTR || "0.00001",
-  reconnectInitialDelayMs: Number(process.env.RECONNECT_INITIAL_DELAY_MS || "1000"),
-  reconnectMaxDelayMs: Number(process.env.RECONNECT_MAX_DELAY_MS || "30000"),
-  rpcRetryInitialDelayMs: Number(process.env.RPC_RETRY_INITIAL_DELAY_MS || "500"),
-  rpcRetryMaxDelayMs: Number(process.env.RPC_RETRY_MAX_DELAY_MS || "10000"),
+
+  // The fixed sweep amount is exactly 0.007 ASTR.
+  sweepAmountAstr: process.env.SWEEP_AMOUNT_ASTR || "0.007",
+
+  // The amount left for the transaction fee is not available as a tip.
+  // Increase this value if the actual network fee is higher.
+  sweepFeeReserveAstr: process.env.SWEEP_FEE_RESERVE_ASTR || "0.0005",
+
+  reconnectInitialDelayMs: positiveNumber(
+    "RECONNECT_INITIAL_DELAY_MS",
+    process.env.RECONNECT_INITIAL_DELAY_MS || "1000",
+  ),
+  reconnectMaxDelayMs: positiveNumber(
+    "RECONNECT_MAX_DELAY_MS",
+    process.env.RECONNECT_MAX_DELAY_MS || "30000",
+  ),
+  rpcRetryInitialDelayMs: positiveNumber(
+    "RPC_RETRY_INITIAL_DELAY_MS",
+    process.env.RPC_RETRY_INITIAL_DELAY_MS || "500",
+  ),
+  rpcRetryMaxDelayMs: positiveNumber(
+    "RPC_RETRY_MAX_DELAY_MS",
+    process.env.RPC_RETRY_MAX_DELAY_MS || "10000",
+  ),
+
   sponsorExtraAstr: process.env.SPONSOR_EXTRA_ASTR || "0.01",
   maxSponsorFundingAstr: process.env.MAX_SPONSOR_FUNDING_ASTR || "1",
 };
@@ -41,11 +72,14 @@ let api = null;
 let provider = null;
 let execPair = null;
 let sponsorPair = null;
+
 let unsubscribeAccount = null;
 let unsubscribeHeads = null;
+
 let reconnecting = false;
 let shuttingDown = false;
 let sweepInProgress = false;
+let sweepQueued = false;
 let operationInProgress = false;
 let cooldownProcessing = false;
 let unlockInitiated = false;
@@ -54,6 +88,7 @@ let reconnectGeneration = 0;
 
 let protectedOperationGas = 0n;
 let protectedOperationLabel = null;
+
 let dappTx = null;
 let dappQuery = null;
 
@@ -95,7 +130,11 @@ const UNIT = 10n ** 18n;
 function astr(value) {
   const n = toBigInt(value);
   const whole = n / UNIT;
-  const fraction = (n % UNIT).toString().padStart(18, "0").replace(/0+$/, "");
+  const fraction = (n % UNIT)
+    .toString()
+    .padStart(18, "0")
+    .replace(/0+$/, "");
+
   return fraction ? `${whole}.${fraction}` : whole.toString();
 }
 
@@ -116,6 +155,7 @@ function parseAstr(value) {
   }
 
   const normalizedFraction = (fraction + "0".repeat(18)).slice(0, 18);
+
   return BigInt(whole) * UNIT + BigInt(normalizedFraction);
 }
 
@@ -135,16 +175,14 @@ function maxBigInt(a, b) {
   return a > b ? a : b;
 }
 
-function minBigInt(a, b) {
-  return a < b ? a : b;
-}
-
 function isFeeError(err) {
   const message = String(err?.message || err || "");
+
   return (
     message.includes("1010") ||
     message.includes("Inability to pay some fees") ||
-    message.includes("account balance too low")
+    message.includes("account balance too low") ||
+    message.includes("Payment")
   );
 }
 
@@ -206,17 +244,30 @@ async function initializeAccounts() {
   if (CONFIG.execMnemonic) {
     execPair = keyring.addFromUri(CONFIG.execMnemonic);
   } else {
-    execPair = keyring.addFromSeed(
-      Buffer.from(CONFIG.execPrivateKey.replace(/^0x/, ""), "hex"),
-    );
+    const seed = Buffer.from(CONFIG.execPrivateKey.replace(/^0x/, ""), "hex");
+
+    if (seed.length !== 32) {
+      throw new Error("EXEC_PRIVATE_KEY must decode to a 32-byte sr25519 seed");
+    }
+
+    execPair = keyring.addFromSeed(seed);
   }
 
   if (CONFIG.sponsorMnemonic) {
     sponsorPair = keyring.addFromUri(CONFIG.sponsorMnemonic);
   } else {
-    sponsorPair = keyring.addFromSeed(
-      Buffer.from(CONFIG.sponsorPrivateKey.replace(/^0x/, ""), "hex"),
+    const seed = Buffer.from(
+      CONFIG.sponsorPrivateKey.replace(/^0x/, ""),
+      "hex",
     );
+
+    if (seed.length !== 32) {
+      throw new Error(
+        "SPONSOR_PRIVATE_KEY must decode to a 32-byte sr25519 seed",
+      );
+    }
+
+    sponsorPair = keyring.addFromSeed(seed);
   }
 
   if (execPair.address === sponsorPair.address) {
@@ -254,12 +305,8 @@ function verifyRuntime() {
     );
   }
 
-  if (!api.tx.dappStaking) {
-    throw new Error("dApp staking transaction pallet is unavailable");
-  }
-
-  if (!api.query.dappStaking) {
-    throw new Error("dApp staking query pallet is unavailable");
+  if (!api.tx.dappStaking || !api.query.dappStaking) {
+    throw new Error("dApp staking pallet is unavailable");
   }
 
   const requiredCalls = [
@@ -277,7 +324,11 @@ function verifyRuntime() {
     }
   }
 
-  const requiredStorage = ["ledger", "stakerInfo", "activeProtocolState"];
+  const requiredStorage = [
+    "ledger",
+    "stakerInfo",
+    "activeProtocolState",
+  ];
 
   for (const storage of requiredStorage) {
     if (typeof api.query.dappStaking[storage] !== "function") {
@@ -333,9 +384,7 @@ function verifyRuntime() {
 
 function getExecAccountId() {
   if (!api || !execPair) {
-    throw new Error(
-      "API and exec account must be initialized before querying dApp staking",
-    );
+    throw new Error("API and exec account must be initialized");
   }
 
   return api.createType("AccountId32", execPair.address);
@@ -372,6 +421,7 @@ async function disconnectCurrent() {
 
 async function connect() {
   const generation = ++reconnectGeneration;
+
   await disconnectCurrent();
 
   provider = new WsProvider(CONFIG.wss, 10_000);
@@ -404,12 +454,10 @@ async function connect() {
     api.rpc.system.properties(),
   ]);
 
-  const specVersion = api.runtimeVersion.specVersion.toNumber();
-
   info("Connected to Astar", {
     chain: chain.toString(),
     specName: api.runtimeVersion.specName.toString(),
-    specVersion,
+    specVersion: api.runtimeVersion.specVersion.toNumber(),
     properties: properties.toJSON(),
   });
 
@@ -423,20 +471,18 @@ async function connect() {
 function extractFrozenAmount(data) {
   const candidates = [];
 
-  const fields = [
+  for (const field of [
     "frozen",
     "miscFrozen",
     "feeFrozen",
     "misc_frozen",
     "fee_frozen",
-  ];
+  ]) {
+    if (data[field] === undefined || data[field] === null) continue;
 
-  for (const field of fields) {
-    if (data[field] !== undefined && data[field] !== null) {
-      try {
-        candidates.push(toBigInt(data[field]));
-      } catch {}
-    }
+    try {
+      candidates.push(toBigInt(data[field]));
+    } catch {}
   }
 
   if (candidates.length === 0) return 0n;
@@ -451,8 +497,10 @@ async function getAccountState(address) {
   return retry("system.account state", async () => {
     const account = await api.query.system.account(address);
     const data = account.data;
+
     const free = toBigInt(data.free);
-    const reserved = data.reserved !== undefined ? toBigInt(data.reserved) : 0n;
+    const reserved =
+      data.reserved !== undefined ? toBigInt(data.reserved) : 0n;
     const frozen = extractFrozenAmount(data);
     const transferable = free > frozen ? free - frozen : 0n;
 
@@ -469,112 +517,124 @@ async function getAccountState(address) {
 }
 
 async function getFreeBalance(address) {
-  const state = await getAccountState(address);
-  return state.free;
+  return (await getAccountState(address)).free;
 }
 
 /* -------------------------------------------------------------------------- */
 /* Transaction finalization                                                   */
 /* -------------------------------------------------------------------------- */
 
-async function submitFinalized(tx, signer, label) {
-  return new Promise(async (resolve, reject) => {
+/*
+ * signOptions is deliberately supported here.
+ *
+ * Example:
+ *   submitFinalized(tx, execPair, "Sweep", { nonce, tip })
+ *
+ * Without this parameter being forwarded to signAndSend, the nonce and tip
+ * passed by the caller would have no effect.
+ */
+async function submitFinalized(tx, signer, label, signOptions = {}) {
+  return new Promise((resolve, reject) => {
     let unsubscribe = null;
     let finished = false;
 
-    const fail = (err) => {
-      if (finished) return;
-      finished = true;
-
+    const cleanup = () => {
       if (unsubscribe) {
         try {
           unsubscribe();
         } catch {}
+        unsubscribe = null;
       }
+    };
 
+    const fail = (err) => {
+      if (finished) return;
+      finished = true;
+      cleanup();
       reject(err);
     };
 
-    try {
-      unsubscribe = await tx.signAndSend(signer, (result) => {
-        if (finished) return;
+    const onResult = (result) => {
+      if (finished) return;
 
-        if (result.status.isInBlock) {
-          info(`${label}: included`, {
-            block: result.status.asInBlock.toHex(),
-          });
-        }
+      if (result.status.isInBlock) {
+        info(`${label}: included`, {
+          block: result.status.asInBlock.toHex(),
+        });
+      }
 
-        if (result.dispatchError) {
-          let message = result.dispatchError.toString();
-          let section = null;
-          let method = null;
+      if (result.dispatchError) {
+        let message = result.dispatchError.toString();
+        let section = null;
+        let method = null;
 
-          if (result.dispatchError.isModule) {
-            const decoded = api.registry.findMetaError(
-              result.dispatchError.asModule,
-            );
-
-            section = decoded.section;
-            method = decoded.name;
-            message = `${decoded.section}.${decoded.name}: ${decoded.docs.join(" ")}`;
-          }
-
-          const err = new Error(`${label} failed: ${message}`);
-          err.dispatchError = result.dispatchError;
-          err.dispatchSection = section;
-          err.dispatchMethod = method;
-          err.includedBlock = result.status.isInBlock
-            ? result.status.asInBlock.toHex()
-            : null;
-
-          fail(err);
-          return;
-        }
-
-        if (
-          result.status.isDropped ||
-          result.status.isInvalid ||
-          result.status.isUsurped ||
-          result.status.isRetracted ||
-          result.status.isFinalityTimeout
-        ) {
-          const statusName = [
-            "Dropped",
-            "Invalid",
-            "Usurped",
-            "Retracted",
-            "FinalityTimeout",
-          ].find((name) => result.status[`is${name}`]);
-
-          fail(
-            new Error(
-              `${label} transaction status: ${statusName || result.status.type}`,
-            ),
+        if (result.dispatchError.isModule) {
+          const decoded = api.registry.findMetaError(
+            result.dispatchError.asModule,
           );
 
-          return;
+          section = decoded.section;
+          method = decoded.name;
+          message = `${decoded.section}.${decoded.name}: ${decoded.docs.join(" ")}`;
         }
 
-        if (result.status.isFinalized) {
-          finished = true;
+        const err = new Error(`${label} failed: ${message}`);
+        err.dispatchError = result.dispatchError;
+        err.dispatchSection = section;
+        err.dispatchMethod = method;
+        err.includedBlock = result.status.isInBlock
+          ? result.status.asInBlock.toHex()
+          : null;
 
-          info(`${label}: finalized`, {
-            block: result.status.asFinalized.toHex(),
-          });
+        fail(err);
+        return;
+      }
 
-          if (unsubscribe) {
-            try {
-              unsubscribe();
-            } catch {}
-          }
+      if (
+        result.status.isDropped ||
+        result.status.isInvalid ||
+        result.status.isUsurped ||
+        result.status.isRetracted ||
+        result.status.isFinalityTimeout
+      ) {
+        const statusName = [
+          "Dropped",
+          "Invalid",
+          "Usurped",
+          "Retracted",
+          "FinalityTimeout",
+        ].find((name) => result.status[`is${name}`]);
 
-          resolve(result);
-        }
-      });
-    } catch (err) {
-      fail(err);
-    }
+        fail(
+          new Error(
+            `${label} transaction status: ${statusName || result.status.type}`,
+          ),
+        );
+        return;
+      }
+
+      if (result.status.isFinalized) {
+        finished = true;
+
+        info(`${label}: finalized`, {
+          block: result.status.asFinalized.toHex(),
+        });
+
+        cleanup();
+        resolve(result);
+      }
+    };
+
+    (async () => {
+      try {
+        unsubscribe = await tx.signAndSend(signer, signOptions, onResult);
+
+        // The callback can theoretically complete before signAndSend resolves.
+        if (finished) cleanup();
+      } catch (err) {
+        fail(err);
+      }
+    })();
   });
 }
 
@@ -582,6 +642,12 @@ async function submitFinalized(tx, signer, label) {
 /* Fee estimation                                                             */
 /* -------------------------------------------------------------------------- */
 
+/*
+ * Used for staking and sponsor transactions, not for the sweep.
+ *
+ * The sweep deliberately avoids transactionPaymentApi.queryInfo because the
+ * observed endpoint traps with RPC error 4003 on this runtime/provider.
+ */
 async function estimateFee(tx, signer) {
   return retry("paymentInfo", async () => {
     const result = await tx.paymentInfo(signer);
@@ -649,7 +715,7 @@ async function sponsorFundExec(requiredAmount, reason) {
 
   const transferTx = api.tx.balances.transferKeepAlive(
     execPair.address,
-    funding,
+    funding.toString(),
   );
 
   const transferFee = await estimateFee(transferTx, sponsorPair);
@@ -674,17 +740,13 @@ async function sponsorFundExec(requiredAmount, reason) {
   protectedOperationGas = funding;
   protectedOperationLabel = reason;
 
-  try {
-    await submitFinalized(
-      transferTx,
-      sponsorPair,
-      `Sponsor → exec ${astr(funding)} ASTR`,
-    );
+  await submitFinalized(
+    transferTx,
+    sponsorPair,
+    `Sponsor → exec ${astr(funding)} ASTR`,
+  );
 
-    return funding;
-  } catch (err) {
-    throw err;
-  }
+  return funding;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -734,7 +796,9 @@ async function submitExecOperation(txFactory, label) {
       }
     }
 
-    await submitFinalized(tx, execPair, label);
+    const nonce = await api.rpc.system.accountNextIndex(execPair.address);
+
+    await submitFinalized(tx, execPair, label, { nonce });
 
     protectedOperationGas = 0n;
     protectedOperationLabel = null;
@@ -764,69 +828,60 @@ async function transfer(signer, destination, amount, label) {
     throw new Error(`Refusing zero/negative transfer: ${amount}`);
   }
 
-  const tx = api.tx.balances.transferKeepAlive(destination, amount);
-  return submitFinalized(tx, signer, label);
-}
-
-/* -------------------------------------------------------------------------- */
-/* Sweep helpers                                                              */
-/* -------------------------------------------------------------------------- */
-
-function isFrozenError(err) {
-  return (
-    err?.dispatchMethod === "Frozen" ||
-    String(err?.message || "").includes("Frozen") ||
-    String(err?.message || "").includes('{"token":"Frozen"}')
-  );
-}
-
-function calculateSweepAmount({
-  free,
-  frozen,
-  reserve,
-  fee,
-  protectedGas = 0n,
-}) {
-  const protectedBalance = maxBigInt(
-    maxBigInt(reserve, frozen),
-    protectedGas,
+  const tx = api.tx.balances.transferKeepAlive(
+    destination,
+    amount.toString(),
   );
 
-  const feeWithSafety = addFeeSafety(fee);
+  const nonce = await api.rpc.system.accountNextIndex(signer.address);
 
-  const amount =
-    free > protectedBalance + feeWithSafety
-      ? free - protectedBalance - feeWithSafety
-      : 0n;
-
-  return {
-    amount,
-    protectedBalance,
-    feeWithSafety,
-  };
+  return submitFinalized(tx, signer, label, { nonce });
 }
 
 /* -------------------------------------------------------------------------- */
 /* Sweep                                                                      */
 /* -------------------------------------------------------------------------- */
 
+const SWEEP_AMOUNT = parseAstr(CONFIG.sweepAmountAstr);
+const SWEEP_FEE_RESERVE = parseAstr(CONFIG.sweepFeeReserveAstr);
+const MIN_REMAINING = parseAstr(CONFIG.minRemainingAstr);
+
+/*
+ * Fixed transfer:
+ *   0.007 ASTR = 7_000_000_000_000_000 planck
+ *
+ * Tip:
+ *   transferable balance - fixed transfer - fee reserve - protected balance
+ *
+ * This avoids the failing transactionPaymentApi.queryInfo RPC and prevents
+ * spending the entire available balance on a tip before the fee is charged.
+ */
 async function sweep(reason) {
   if (sweepInProgress) {
-    info("Sweep skipped: another sweep is running");
+    sweepQueued = true;
+    info("Sweep queued: another sweep is running", { reason });
     return false;
   }
 
   if (operationInProgress) {
-    info("Sweep skipped: exec operation is active");
+    sweepQueued = true;
+    info("Sweep queued: an exec operation is active", { reason });
     return false;
   }
 
   sweepInProgress = true;
+  let completed = false;
 
   try {
-    // Exactly 0.007 ASTR in planck.
-    const transferAmount = 7_000_000_000_000_000n;
     const account = await getAccountState(execPair.address);
+
+    const protectedBalance = maxBigInt(
+      MIN_REMAINING,
+      protectedOperationGas,
+    );
+
+    const totalRequired =
+      SWEEP_AMOUNT + SWEEP_FEE_RESERVE + protectedBalance;
 
     info("Sweep account state", {
       freePlanck: account.free.toString(),
@@ -835,62 +890,39 @@ async function sweep(reason) {
       frozenAstr: astr(account.frozen),
       transferableBalancePlanck: account.transferable.toString(),
       transferableBalanceAstr: astr(account.transferable),
-      transferAmountPlanck: transferAmount.toString(),
-      transferAmountAstr: astr(transferAmount),
-      protectedOperationGasPlanck:
-        protectedOperationGas.toString(),
+      transferAmountPlanck: SWEEP_AMOUNT.toString(),
+      transferAmountAstr: astr(SWEEP_AMOUNT),
+      feeReservePlanck: SWEEP_FEE_RESERVE.toString(),
+      feeReserveAstr: astr(SWEEP_FEE_RESERVE),
+      protectedBalanceAstr: astr(protectedBalance),
       protectedOperationGasAstr: astr(protectedOperationGas),
       protectedOperationLabel,
       reason,
       vault: CONFIG.vault,
     });
 
-    if (account.transferable <= transferAmount) {
-      warn(
-        "Sweep aborted: transferable balance does not cover the fixed transfer amount",
-        {
-          transferableBalancePlanck:
-            account.transferable.toString(),
-          transferableBalanceAstr: astr(account.transferable),
-          transferAmountPlanck: transferAmount.toString(),
-          transferAmountAstr: astr(transferAmount),
-        },
-      );
+    if (account.transferable < totalRequired) {
+      warn("Sweep deferred: insufficient transferable balance", {
+        transferableAstr: astr(account.transferable),
+        transferAmountAstr: astr(SWEEP_AMOUNT),
+        feeReserveAstr: astr(SWEEP_FEE_RESERVE),
+        protectedBalanceAstr: astr(protectedBalance),
+        requiredAstr: astr(totalRequired),
+        reason,
+      });
 
       return false;
     }
 
-    // Construct the exact transfer extrinsic.
-    const tx = api.tx.balances.transferKeepAlive(
-      CONFIG.vault,
-      transferAmount.toString(),
-    );
-
-    // Estimate the fee before calculating the tip.
-    const feeInfo = await retry(
-      "transactionPaymentApi.queryInfo",
-      () =>
-        api.call.transactionPaymentApi.queryInfo(
-          tx.toHex(),
-          tx.length,
-        ),
-    );
-
-    const estimatedBaseFee = toBigInt(feeInfo.partialFee);
-
-    // Keep all calculations in planck using BigInt.
+    // Tip only the amount left after the fixed transfer and fee reserve.
     const tip =
       account.transferable -
-      transferAmount -
-      estimatedBaseFee;
+      SWEEP_AMOUNT -
+      SWEEP_FEE_RESERVE -
+      protectedBalance;
 
-    if (tip <= 0n) {
-      warn("Sweep aborted: computed tip is zero or negative", {
-        transferableBalancePlanck:
-          account.transferable.toString(),
-        transferAmountPlanck: transferAmount.toString(),
-        estimatedBaseFeePlanck:
-          estimatedBaseFee.toString(),
+    if (tip < 0n) {
+      warn("Sweep deferred: computed tip is negative", {
         tipPlanck: tip.toString(),
         reason,
       });
@@ -898,46 +930,47 @@ async function sweep(reason) {
       return false;
     }
 
-    // Fetch the next account nonce.
-    const pendingNonce = await retry(
-      "accountNextIndex",
-      () =>
-        api.rpc.system.accountNextIndex(execPair.address),
+    const tx = api.tx.balances.transferKeepAlive(
+      CONFIG.vault,
+      SWEEP_AMOUNT.toString(),
+    );
+
+    const nonce = await retry("accountNextIndex", () =>
+      api.rpc.system.accountNextIndex(execPair.address),
     );
 
     info("Sweep transaction breakdown", {
-      transferableBalancePlanck:
-        account.transferable.toString(),
-      transferableBalanceAstr: astr(account.transferable),
-      transferAmountPlanck: transferAmount.toString(),
-      transferAmountAstr: astr(transferAmount),
-      estimatedBaseFeePlanck:
-        estimatedBaseFee.toString(),
-      estimatedBaseFeeAstr: astr(estimatedBaseFee),
+      transferAmountPlanck: SWEEP_AMOUNT.toString(),
+      transferAmountAstr: astr(SWEEP_AMOUNT),
       tipPlanck: tip.toString(),
       tipAstr: astr(tip),
-      nonce: pendingNonce.toString(),
+      feeReservePlanck: SWEEP_FEE_RESERVE.toString(),
+      feeReserveAstr: astr(SWEEP_FEE_RESERVE),
+      transferableBalancePlanck: account.transferable.toString(),
+      transferableBalanceAstr: astr(account.transferable),
+      nonce: nonce.toString(),
       reason,
       vault: CONFIG.vault,
     });
 
-    // Submit and wait for finalization.
     await submitFinalized(
       tx,
       execPair,
-      "Sweep 0.009 ASTR to vault",
+      `Sweep ${astr(SWEEP_AMOUNT)} ASTR to vault`,
       {
-        nonce: pendingNonce,
-        tip,
+        nonce,
+        tip: api.createType("Balance", tip.toString()),
       },
     );
 
+    completed = true;
+
     info("Sweep completed", {
-      transferAmountPlanck: transferAmount.toString(),
-      transferAmountAstr: astr(transferAmount),
+      transferAmountPlanck: SWEEP_AMOUNT.toString(),
+      transferAmountAstr: astr(SWEEP_AMOUNT),
       tipPlanck: tip.toString(),
       tipAstr: astr(tip),
-      nonce: pendingNonce.toString(),
+      nonce: nonce.toString(),
       reason,
       vault: CONFIG.vault,
     });
@@ -952,6 +985,22 @@ async function sweep(reason) {
     return false;
   } finally {
     sweepInProgress = false;
+
+    // Process at most one queued sweep immediately. If it still cannot run,
+    // the next balance update or finalized block can trigger another attempt.
+    if (sweepQueued && !shuttingDown) {
+      sweepQueued = false;
+
+      setImmediate(() => {
+        if (!shuttingDown) {
+          sweep(completed ? "queued-after-success" : "queued-retry").catch(
+            (err) => {
+              error("Queued sweep failed", { error: formatError(err) });
+            },
+          );
+        }
+      });
+    }
   }
 }
 
@@ -971,10 +1020,8 @@ async function getStakerPositions() {
       const args = key.args;
       if (!args || args.length < 2) continue;
 
-      const dapp = args[args.length - 1];
-
       positions.push({
-        dapp,
+        dapp: args[args.length - 1],
         codec: value,
         human: value.toHuman ? value.toHuman() : null,
         json: value.toJSON ? value.toJSON() : null,
@@ -1010,13 +1057,11 @@ function extractStakeAmount(codec) {
     return total;
   }
 
-  const directCandidates = [
+  for (const value of [
     json.amount,
     json.stakedAmount,
     json.staked_amount,
-  ];
-
-  for (const value of directCandidates) {
+  ]) {
     if (value === undefined || value === null) continue;
 
     try {
@@ -1079,13 +1124,8 @@ async function claimStakerRewards() {
 function buildUnstakeTx(dapp, amount) {
   const args = dappTx.unstake.meta.args || [];
 
-  if (args.length === 1) {
-    return dappTx.unstake(dapp);
-  }
-
-  if (args.length === 2) {
-    return dappTx.unstake(dapp, amount.toString());
-  }
+  if (args.length === 1) return dappTx.unstake(dapp);
+  if (args.length === 2) return dappTx.unstake(dapp, amount.toString());
 
   throw new Error(
     `Unsupported dappStaking.unstake signature: ${args.map((arg) => arg.name).join(", ")}`,
@@ -1133,7 +1173,6 @@ async function unstakePosition(position) {
       }
 
       const refreshed = await getStakerPositions();
-
       const updated = refreshed.find(
         (item) => item.dapp.toString() === position.dapp.toString(),
       );
@@ -1158,7 +1197,7 @@ async function unstakePosition(position) {
     }
 
     if (isFeeError(err)) {
-      warn("Unstake could not pay fees; sponsor funding/retry will handle it", {
+      warn("Unstake could not pay fees; retry will be handled later", {
         dapp: position.dapp.toString(),
         error: formatError(err),
       });
@@ -1230,8 +1269,7 @@ async function phase1UnstakeAll() {
 
 async function getLedger() {
   return retry("dApp staking ledger", async () => {
-    const accountId = getExecAccountId();
-    return dappQuery.ledger(accountId);
+    return dappQuery.ledger(getExecAccountId());
   });
 }
 
@@ -1253,15 +1291,13 @@ function getUnlockingChunks(ledger) {
 function getChunkUnlockBlock(chunk) {
   if (chunk === null || typeof chunk !== "object") return null;
 
-  const candidates = [
+  for (const value of [
     chunk.unlockBlock,
     chunk.unlockingBlock,
     chunk.block,
     chunk.unlockAt,
     chunk.unlock_block,
-  ];
-
-  for (const value of candidates) {
+  ]) {
     if (value === undefined || value === null) continue;
 
     try {
@@ -1315,24 +1351,22 @@ async function phase1UnlockAll() {
     return false;
   }
 
-  const amountToUnlock = locked;
-
   info("Preparing dApp staking unlock", {
-    amount: astr(amountToUnlock),
-    rawAmount: amountToUnlock.toString(),
-    bitLength: amountToUnlock.toString(2).length,
+    amount: astr(locked),
+    rawAmount: locked.toString(),
+    bitLength: locked.toString(2).length,
   });
 
   try {
     await submitExecOperation(
-      () => dappTx.unlock(amountToUnlock.toString()),
-      `Unlock ${astr(amountToUnlock)} ASTR`,
+      () => dappTx.unlock(locked.toString()),
+      `Unlock ${astr(locked)} ASTR`,
     );
 
     unlockInitiated = true;
 
     info("PHASE 1B COMPLETE: unlock transaction finalized", {
-      amount: astr(amountToUnlock),
+      amount: astr(locked),
     });
 
     return true;
@@ -1399,7 +1433,7 @@ async function startBalanceWatcher() {
   unsubscribeAccount = await api.query.system.account(
     execPair.address,
     async (account) => {
-      if (operationInProgress || sweepInProgress) return;
+      if (shuttingDown) return;
 
       try {
         const free = toBigInt(account.data.free);
@@ -1415,10 +1449,14 @@ async function startBalanceWatcher() {
           protectedOperationLabel,
         });
 
+        if (operationInProgress || sweepInProgress) {
+          sweepQueued = true;
+          return;
+        }
+
         if (!unlockInitiated) {
           const ledger = await getLedger();
           const json = codecToJson(ledger);
-
           const locked =
             json?.locked !== undefined && json?.locked !== null
               ? toBigInt(json.locked)
@@ -1564,7 +1602,7 @@ async function processCooldown(finalizedBlock) {
     const json = codecToJson(ledger);
 
     const locked =
-      json?.locked !== undefined && json?.locked !== null
+      json?.locked !== undefined && json.locked !== null
         ? toBigInt(json.locked)
         : 0n;
 
@@ -1597,6 +1635,7 @@ async function processCooldown(finalizedBlock) {
   }
 
   withdrawalCompleted = false;
+
   if (!status.matured) return;
 
   info("Unlocking chunk(s) matured", {
@@ -1607,7 +1646,7 @@ async function processCooldown(finalizedBlock) {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Phase 4                                                                     */
+/* Phase 4                                                                    */
 /* -------------------------------------------------------------------------- */
 
 async function phase4CooldownWatcher() {
@@ -1628,8 +1667,7 @@ async function phase4CooldownWatcher() {
       cooldownProcessing = true;
 
       try {
-        const finalizedBlock = toBigInt(header.number);
-        await processCooldown(finalizedBlock);
+        await processCooldown(toBigInt(header.number));
       } catch (err) {
         error("Cooldown watcher error", {
           error: formatError(err),
@@ -1643,8 +1681,7 @@ async function phase4CooldownWatcher() {
   info("Phase 4 cooldown watcher active");
 
   try {
-    const currentBlock = await getCurrentFinalizedBlock();
-    await processCooldown(currentBlock);
+    await processCooldown(await getCurrentFinalizedBlock());
   } catch (err) {
     error("Initial cooldown check failed", {
       error: formatError(err),
@@ -1673,6 +1710,10 @@ async function reconnect() {
         await phase4CooldownWatcher();
 
         info("Astar WebSocket reconnected");
+
+        // Recheck the balance after reconnecting, in case an update was missed.
+        await sweep("after-reconnect");
+
         return;
       } catch (err) {
         warn("Reconnect failed", {
@@ -1696,9 +1737,16 @@ async function reconnect() {
 async function main() {
   info("================================================");
   info(
-    `ASTAR NATIVE RUNTIME-${CONFIG.expectedSpecVersion} UNSTAKE / AUTO-SWEEP BOT`,
+    `ASTAR RUNTIME-${CONFIG.expectedSpecVersion} UNSTAKE / AUTO-SWEEP BOT`,
   );
   info("================================================");
+
+  info("Sweep configuration", {
+    transferAmountAstr: astr(SWEEP_AMOUNT),
+    transferAmountPlanck: SWEEP_AMOUNT.toString(),
+    feeReserveAstr: astr(SWEEP_FEE_RESERVE),
+    minimumRemainingAstr: astr(MIN_REMAINING),
+  });
 
   await initializeAccounts();
   await connect();
@@ -1732,9 +1780,7 @@ async function main() {
     });
   }
 
-  info(
-    "Bot is now monitoring the ASTR account and dApp staking unlocking period",
-  );
+  info("Bot is monitoring the ASTR account and dApp staking unlock period");
 }
 
 /* -------------------------------------------------------------------------- */
