@@ -824,8 +824,8 @@ async function sweep(reason) {
   sweepInProgress = true;
 
   try {
-    // Exactly 0.009 ASTR in planck.
-    const transferAmount = 9_000_000_000_000_000n;
+    // Exactly 0.007 ASTR in planck.
+    const transferAmount = 7_000_000_000_000_000n;
     const account = await getAccountState(execPair.address);
 
     info("Sweep account state", {
