@@ -36,7 +36,7 @@ const CONFIG = {
   feeSafetyBps: BigInt(process.env.FEE_SAFETY_BPS || "2000"),
   minRemainingAstr: process.env.MIN_REMAINING_ASTR || "0.00001",
   // The fixed sweep amount is exactly 0.007 ASTR.
-  sweepAmountAstr: process.env.SWEEP_AMOUNT_ASTR || "0.007",
+  sweepAmountAstr: process.env.SWEEP_AMOUNT_ASTR || "0.1",
   // The amount left for the transaction fee is not available as a tip.
   // Increase this value if the actual network fee is higher.
   sweepFeeReserveAstr: process.env.SWEEP_FEE_RESERVE_ASTR || "0.0005",
