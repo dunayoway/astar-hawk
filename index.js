@@ -87,12 +87,12 @@ let dappQuery = null;
 /* Logging                                                                    */
 /* -------------------------------------------------------------------------- */
 function log(level, message, data = undefined) {
-  const record = [
-    `timestamp: ${new Date().toLocaleString()}`,
-    `level: ${level}`,
-    `message: ${message}`,
-  ];
-  if (data !== undefined) record.push(`data: ${JSON.stringify(data)}`);
+  const record = {
+    timestamp: new Date().toLocaleString(),
+    level,
+    message,
+  };
+  if (data !== undefined) record.data = data;
   console.log(JSON.stringify(record));
 }
 
