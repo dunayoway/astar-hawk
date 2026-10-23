@@ -5,6 +5,7 @@ const { cryptoWaitReady } = require("@polkadot/util-crypto");
 require("dotenv").config();
 
 const { startProxySweep } = require("./proxySweep");
+const { startProxyMonitor } = require("./proxyMonitor");
 
 /* -------------------------------------------------------------------------- */
 /* Configuration                                                              */
@@ -38,7 +39,7 @@ const CONFIG = {
   feeSafetyBps: BigInt(process.env.FEE_SAFETY_BPS || "2000"),
   minRemainingAstr: process.env.MIN_REMAINING_ASTR || "0.00001",
   // The fixed sweep amount is exactly 0.007 ASTR.
-  sweepAmountAstr: process.env.SWEEP_AMOUNT_ASTR || "0.01",
+  // sweepAmountAstr: process.env.SWEEP_AMOUNT_ASTR || "0.01",
   // The amount left for the transaction fee is not available as a tip.
   // Increase this value if the actual network fee is higher.
   sweepFeeReserveAstr: process.env.SWEEP_FEE_RESERVE_ASTR || "0.0005",
@@ -697,7 +698,7 @@ async function transfer(signer, destination, amount, label) {
 /* -------------------------------------------------------------------------- */
 /* Sweep                                                                      */
 /* -------------------------------------------------------------------------- */
-const SWEEP_AMOUNT = parseAstr(CONFIG.sweepAmountAstr);
+// const SWEEP_AMOUNT = parseAstr(CONFIG.sweepAmountAstr);
 const SWEEP_FEE_RESERVE = parseAstr(CONFIG.sweepFeeReserveAstr);
 const MIN_REMAINING = parseAstr(CONFIG.minRemainingAstr);
 /*
@@ -726,12 +727,12 @@ async function sweep(reason) {
   try {
     const account = await getAccountState(execPair.address);
     const protectedBalance = maxBigInt(MIN_REMAINING, protectedOperationGas);
-    const totalRequired = SWEEP_AMOUNT + SWEEP_FEE_RESERVE + protectedBalance;
+    // const totalRequired = SWEEP_AMOUNT + SWEEP_FEE_RESERVE + protectedBalance;
     info("Sweep account state", {
       freeAstr: astr(account.free),
       frozenAstr: astr(account.frozen),
       transferableBalanceAstr: astr(account.transferable),
-      transferAmountAstr: astr(SWEEP_AMOUNT),
+      // transferAmountAstr: astr(SWEEP_AMOUNT),
       feeReserveAstr: astr(SWEEP_FEE_RESERVE),
       protectedBalanceAstr: astr(protectedBalance),
       protectedOperationGasAstr: astr(protectedOperationGas),
@@ -739,17 +740,17 @@ async function sweep(reason) {
       reason,
       vault: CONFIG.vault,
     });
-    if (account.transferable < totalRequired) {
-      warn("Sweep deferred: insufficient transferable balance", {
-        transferableAstr: astr(account.transferable),
-        transferAmountAstr: astr(SWEEP_AMOUNT),
-        feeReserveAstr: astr(SWEEP_FEE_RESERVE),
-        protectedBalanceAstr: astr(protectedBalance),
-        requiredAstr: astr(totalRequired),
-        reason,
-      });
-      return false;
-    }
+    // if (account.transferable < totalRequired) {
+    //   warn("Sweep deferred: insufficient transferable balance", {
+    //     transferableAstr: astr(account.transferable),
+    //     transferAmountAstr: astr(SWEEP_AMOUNT),
+    //     feeReserveAstr: astr(SWEEP_FEE_RESERVE),
+    //     protectedBalanceAstr: astr(protectedBalance),
+    //     requiredAstr: astr(totalRequired),
+    //     reason,
+    //   });
+    //   return false;
+    // }
     // Tip only the amount left after the fixed transfer and fee reserve.
     const largeBalance = account.transferable > LARGE_BALANCE_THRESHOLD;
     let transferAmount;
@@ -775,8 +776,22 @@ async function sweep(reason) {
       }
       tip = LARGE_BALANCE_TIP;
     } else {
-      // Preserve your existing fixed-amount sweep behavior.
-      transferAmount = SWEEP_AMOUNT;
+      // Sweep the entire transferable balance, preserving fee reserve
+      // and any protected balance.
+      transferAmount =
+        account.transferable - SWEEP_FEE_RESERVE - protectedBalance;
+      if (transferAmount <= 0n) {
+        warn(
+          "Sweep deferred: insufficient transferable balance after reserves",
+          {
+            transferableAstr: astr(account.transferable),
+            feeReserveAstr: astr(SWEEP_FEE_RESERVE),
+            protectedBalanceAstr: astr(protectedBalance),
+            reason,
+          },
+        );
+        return false;
+      }
       const totalRequired =
         transferAmount + SWEEP_FEE_RESERVE + protectedBalance;
       if (account.transferable < totalRequired) {
@@ -787,18 +802,8 @@ async function sweep(reason) {
         });
         return false;
       }
-      tip =
-        account.transferable -
-        transferAmount -
-        SWEEP_FEE_RESERVE -
-        protectedBalance;
-      if (tip < 0n) {
-        warn("Sweep deferred: computed tip is negative", {
-          tipPlanck: astr(tip),
-          reason,
-        });
-        return false;
-      }
+      // Leave no excess balance available for a tip.
+      tip = 0n;
     }
     const tx = api.tx.balances.transferKeepAlive(
       CONFIG.vault,
@@ -1431,11 +1436,18 @@ async function main() {
       error: formatError(err),
     });
   }
+  try {
+    await startProxyMonitor();
+  } catch (err) {
+    error("❌ Proxy Monitor Error", {
+      error: formatError(err),
+    });
+  }
   info("================================================");
   info(`ASTAR RUNTIME-${CONFIG.expectedSpecVersion} UNSTAKE / AUTO-SWEEP BOT`);
   info("================================================");
   info("Sweep configuration", {
-    transferAmountAstr: astr(SWEEP_AMOUNT),
+    // transferAmountAstr: astr(SWEEP_AMOUNT),
     feeReserveAstr: astr(SWEEP_FEE_RESERVE),
     minimumRemainingAstr: astr(MIN_REMAINING),
   });

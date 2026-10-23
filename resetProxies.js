@@ -23,7 +23,7 @@ const CONFIG = {
   safetyMargin: 10n ** 16n,
 
   // The requested tip for each removal attempt.
-  removalTip: ASTR,
+  removalTip: ASTR / 2n,
 
   maxRemovalAttempts: 3,
   retryDelayMs: 1500,
@@ -164,12 +164,9 @@ function submitAndWait(api, tx, signer, label, options = {}) {
 // Sign a removal transaction before sponsor funding.
 // The signer nonce is not changed by a transfer to this account.
 // ------------------------------------------------------------
-
 async function prepareRemoval(api, signer) {
   const tx = api.tx.proxy.removeProxies();
-
   const nonce = await api.rpc.system.accountNextIndex(signer.address);
-
   await tx.signAsync(signer, {
     nonce: nonce.toString(),
     tip: CONFIG.removalTip.toString(),
@@ -186,7 +183,6 @@ async function prepareRemoval(api, signer) {
 // Submit a previously signed extrinsic.
 // Resolves only when finalized.
 // ------------------------------------------------------------
-
 function submitPreparedRemoval(api, signedTx, attempt) {
   return new Promise((resolve, reject) => {
     let unsubscribe;
