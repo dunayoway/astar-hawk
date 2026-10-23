@@ -225,23 +225,64 @@ async function startProxySweep() {
     console.log("\nConfigured proxies:");
     console.dir(proxyEntries.toJSON(), { depth: null });
 
-    const authorized = proxyEntries.some((entry) => {
-      try {
-        return (
-          normalizeAddress(entry.delegate.toString()) === proxySigner.address &&
-          entry.proxyType.toString() === "Balances" &&
-          Number(entry.delay.toString()) === 0
-        );
-      } catch {
-        return false;
-      }
-    });
+    async function waitForProxyAuthorization() {
+      const retryIntervalMs = 3000;
 
-    if (!authorized) {
-      throw new Error(
-        "The proxy signer is not configured as a zero-delay " +
-          "Balances proxy for the main wallet. Verify on-chain permissions.",
-      );
+      while (!stopped) {
+        try {
+          const [proxyEntries] = await api.query.proxy.proxies(mainAddress);
+
+          console.log("\nConfigured proxies:");
+          console.dir(proxyEntries.toJSON(), { depth: null });
+
+          const authorized = proxyEntries.some((entry) => {
+            try {
+              return (
+                normalizeAddress(entry.delegate.toString()) ===
+                  proxySigner.address &&
+                entry.proxyType.toString() === "Any" &&
+                Number(entry.delay.toString()) === 0
+              );
+            } catch {
+              return false;
+            }
+          });
+
+          if (authorized) {
+            console.log(
+              "Proxy authorization confirmed. Starting balance monitoring.",
+            );
+            return true;
+          }
+
+          console.warn(
+            `Proxy ${proxySigner.address} is not yet authorized for ` +
+              "zero-delay Balances operations. Retrying in 3 seconds...",
+          );
+        } catch (error) {
+          console.error(
+            "Could not check proxy authorization:",
+            error.message || error,
+          );
+          console.log("Retrying authorization check in 3 seconds...");
+        }
+
+        await new Promise((resolve) => {
+          timer = setTimeout(() => {
+            timer = null;
+            resolve();
+          }, retryIntervalMs);
+        });
+      }
+
+      return false;
+    }
+
+    const authorized = await waitForProxyAuthorization();
+
+    if (!authorized || stopped) {
+      console.log("Proxy authorization monitoring stopped.");
+      return;
     }
 
     async function performSweep() {
@@ -270,11 +311,7 @@ async function startProxySweep() {
           vaultAddress,
           true, // Keep the main account alive.
         );
-        const outerCall = api.tx.proxy.proxy(
-          mainAddress,
-          "Balances",
-          innerCall,
-        );
+        const outerCall = api.tx.proxy.proxy(mainAddress, "Any", innerCall);
         const feeInfo = await outerCall.paymentInfo(proxySigner);
         const estimatedFee = toBigInt(feeInfo.partialFee);
         const proxyAccount = await api.query.system.account(

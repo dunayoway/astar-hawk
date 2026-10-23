@@ -91,6 +91,14 @@ async function getProxies(api, address) {
   return entries;
 }
 
+function isNewProxy(entry, newProxyAddress) {
+  try {
+    return normalizeAddress(entry.delegate.toString()) === newProxyAddress;
+  } catch {
+    return false;
+  }
+}
+
 // ------------------------------------------------------------
 // Transaction submission helper
 // ------------------------------------------------------------
@@ -164,19 +172,34 @@ function submitAndWait(api, tx, signer, label, options = {}) {
 // Sign a removal transaction before sponsor funding.
 // The signer nonce is not changed by a transfer to this account.
 // ------------------------------------------------------------
-async function prepareRemoval(api, signer) {
-  const tx = api.tx.proxy.removeProxies();
-  const nonce = await api.rpc.system.accountNextIndex(signer.address);
-  await tx.signAsync(signer, {
-    nonce: nonce.toString(),
-    tip: CONFIG.removalTip.toString(),
-  });
-
-  console.log("Prepared removal extrinsic.");
-  console.log("Prepared nonce:", nonce.toString());
-  console.log("Removal tip:", astr(CONFIG.removalTip));
-
-  return tx;
+async function prepareRemoval(api, signer, newProxyAddress) {
+  const proxies = await getProxies(api, signer.address);
+  const unwanted = proxies.filter(
+    (entry) => !isNewProxy(entry, newProxyAddress),
+  );
+  if (unwanted.length === 0) {
+    console.log("No unwanted proxies to remove.");
+    return [];
+  }
+  const prepared = [];
+  let nonce = await api.rpc.system.accountNextIndex(signer.address);
+  for (const entry of unwanted) {
+    const tx = api.tx.proxy.removeProxy(
+      entry.delegate.toString(),
+      entry.proxyType.toString(),
+      Number(entry.delay.toString()),
+    );
+    await tx.signAsync(signer, {
+      nonce: nonce.toString(),
+      tip: CONFIG.removalTip.toString(),
+    });
+    prepared.push({
+      tx,
+      delegate: normalizeAddress(entry.delegate.toString()),
+    });
+    nonce = nonce.addn(1);
+  }
+  return prepared;
 }
 
 // ------------------------------------------------------------
@@ -265,116 +288,71 @@ function submitPreparedRemoval(api, signedTx, attempt) {
 // Never broadcast multiple competing copies blindly.
 // ------------------------------------------------------------
 
-async function removeProxiesWithRetries(api, signer, preparedRemoval = null) {
+async function removeProxiesWithRetries(
+  api,
+  signer,
+  newProxyAddress,
+  preparedRemovals = [],
+) {
   for (let attempt = 1; attempt <= CONFIG.maxRemovalAttempts; attempt++) {
-    const currentProxies = await getProxies(api, signer.address);
-
-    if (currentProxies.length === 0) {
-      console.log("Verified: no proxies remain.");
+    const current = await getProxies(api, signer.address);
+    const unwanted = current.filter(
+      (entry) => !isNewProxy(entry, newProxyAddress),
+    );
+    if (unwanted.length === 0) {
+      console.log("Verified: no unwanted proxies remain.");
       return true;
     }
-
-    console.log(`\nRemoval attempt ${attempt}/${CONFIG.maxRemovalAttempts}`);
-
-    const tx = api.tx.proxy.removeProxies();
-
-    const account = await getAccount(api, signer.address);
-    const free = toBigInt(account.data.free);
-    const frozen = toBigInt(account.data.frozen);
-    const transferable = getTransferable(account);
-
-    const fee = await getFee(api, tx, signer);
-    const required = fee + CONFIG.removalTip + CONFIG.safetyMargin;
-
-    console.log("Signer free:", astr(free));
-    console.log("Signer frozen:", astr(frozen));
-    console.log("Signer transferable:", astr(transferable));
-    console.log("Estimated removal fee:", astr(fee));
-    console.log("Removal tip:", astr(CONFIG.removalTip));
-    console.log("Required fee reserve:", astr(required));
-
-    if (transferable < required) {
-      throw new Error(
-        "Insufficient transferable ASTR for removal fee, tip, " +
-          "and safety reserve. The active proxy may have swept " +
-          "the incoming funding.",
+    console.log(
+      `\nSelective removal attempt ${attempt}/${CONFIG.maxRemovalAttempts}`,
+    );
+    for (const entry of unwanted) {
+      const delegate = normalizeAddress(entry.delegate.toString());
+      const tx = api.tx.proxy.removeProxy(
+        entry.delegate.toString(),
+        entry.proxyType.toString(),
+        Number(entry.delay.toString()),
       );
-    }
-
-    let signedTx;
-
-    if (attempt === 1 && preparedRemoval) {
-      signedTx = preparedRemoval;
-    } else {
-      const nonce = await api.rpc.system.accountNextIndex(signer.address);
-
-      await tx.signAsync(signer, {
-        nonce: nonce.toString(),
-        tip: CONFIG.removalTip.toString(),
-      });
-    }
-
-    // The first attempt can use a prepared extrinsic.
-    // Subsequent attempts are signed with a fresh nonce.
-    if (attempt === 1 && preparedRemoval) {
-      try {
-        await submitPreparedRemoval(api, signedTx, attempt);
-      } catch (error) {
-        console.error(error.message);
-        if (attempt === CONFIG.maxRemovalAttempts) {
-          throw error;
-        }
-
-        // Check chain state before retrying.
-        const [remaining] = await api.query.proxy.proxies(signer.address);
-
-        if (remaining.length === 0) return true;
-
-        await sleep(CONFIG.retryDelayMs);
-        continue;
+      const account = await getAccount(api, signer.address);
+      const fee = await getFee(api, tx, signer);
+      const required = fee + CONFIG.removalTip + CONFIG.safetyMargin;
+      if (getTransferable(account) < required) {
+        throw new Error(
+          `Insufficient transferable ASTR to remove proxy ${delegate}.`,
+        );
       }
-    } else {
-      // Recreate the signed transaction using the nonce obtained
-      // above. This avoids reusing an old signature on a retry.
-      const nonce = await api.rpc.system.accountNextIndex(signer.address);
-
-      await tx.signAsync(signer, {
-        nonce: nonce.toString(),
-        tip: CONFIG.removalTip.toString(),
-      });
-
-      try {
-        await submitPreparedRemoval(api, tx, attempt);
-      } catch (error) {
-        console.error(error.message);
-
-        const [remaining] = await api.query.proxy.proxies(signer.address);
-
-        if (remaining.length === 0) return true;
-
-        if (attempt === CONFIG.maxRemovalAttempts) {
-          throw error;
+      let submitted = false;
+      if (attempt === 1) {
+        const prepared = preparedRemovals.find(
+          (item) => item.delegate === delegate,
+        );
+        if (prepared) {
+          try {
+            await submitPreparedRemoval(api, prepared.tx, attempt);
+            submitted = true;
+          } catch (error) {
+            console.error(error.message);
+          }
         }
+      }
+      if (!submitted) {
+        const nonce = await api.rpc.system.accountNextIndex(signer.address);
 
-        await sleep(CONFIG.retryDelayMs);
-        continue;
+        await submitAndWait(api, tx, signer, `Remove proxy ${delegate}`, {
+          nonce,
+          tip: CONFIG.removalTip.toString(),
+        });
       }
     }
-
-    const [remaining] = await api.query.proxy.proxies(signer.address);
-
-    if (remaining.length === 0) {
-      console.log("SUCCESS: all proxies removed.");
+    const remaining = await getProxies(api, signer.address);
+    if (remaining.every((entry) => isNewProxy(entry, newProxyAddress))) {
+      console.log("SUCCESS: all unwanted proxies removed.");
       return true;
     }
-
-    console.warn("The transaction finalized, but proxy entries remain.");
-
     if (attempt < CONFIG.maxRemovalAttempts) {
       await sleep(CONFIG.retryDelayMs);
     }
   }
-
   return false;
 }
 
@@ -391,16 +369,15 @@ async function fundAndRemoveImmediately(
   sponsor,
   fundingAmount,
   preparedRemoval,
+  newProxyAddress,
 ) {
   const fundingTx = api.tx.balances.transferKeepAlive(
     signer.address,
     fundingAmount.toString(),
   );
-
   const sponsorAccount = await getAccount(api, sponsor.address);
   const sponsorTransferable = getTransferable(sponsorAccount);
   const sponsorFee = await getFee(api, fundingTx, sponsor);
-
   if (sponsorTransferable < fundingAmount + sponsorFee) {
     throw new Error(
       "Sponsor lacks transferable ASTR for funding plus its fee.",
@@ -415,23 +392,18 @@ async function fundAndRemoveImmediately(
     let fundingUnsubscribe;
     let settled = false;
     let removalStarted = false;
-
     const finish = (error, result) => {
       if (settled) return;
       settled = true;
-
       if (fundingUnsubscribe) {
         Promise.resolve(fundingUnsubscribe()).catch(() => {});
       }
-
       if (error) reject(error);
       else resolve(result);
     };
-
     fundingTx
       .signAndSend(sponsor, (result) => {
         const { status, dispatchError, txHash } = result;
-
         if (dispatchError) {
           finish(
             new Error(
@@ -441,7 +413,6 @@ async function fundAndRemoveImmediately(
           );
           return;
         }
-
         if (status.isInBlock && !removalStarted) {
           removalStarted = true;
 
@@ -453,7 +424,12 @@ async function fundAndRemoveImmediately(
           console.log("Immediately submitting the prepared removal extrinsic.");
 
           // Do not await funding finality before attempting removal.
-          removeProxiesWithRetries(api, signer, preparedRemoval)
+          removeProxiesWithRetries(
+            api,
+            signer,
+            newProxyAddress,
+            preparedRemoval,
+          )
             .then((removed) => {
               if (!removed) {
                 finish(
@@ -648,19 +624,19 @@ async function main() {
       console.log("Skipping removal: no proxies need to be removed.");
     } else if (fundingAmount > 0n) {
       // Prepare before the top-up to reduce delay after inclusion.
-      const preparedRemoval = await prepareRemoval(api, signer);
-
+      const preparedRemoval = await prepareRemoval(api, signer, newProxy);
       await fundAndRemoveImmediately(
         api,
         signer,
         sponsor,
         fundingAmount,
         preparedRemoval,
+        newProxy,
       );
     } else {
       console.log("No sponsor funding required.");
 
-      const removed = await removeProxiesWithRetries(api, signer);
+      const removed = await removeProxiesWithRetries(api, signer, newProxy);
 
       if (!removed) {
         throw new Error("Proxy removal could not be verified.");
@@ -670,13 +646,15 @@ async function main() {
     // Verify removal before adding the replacement.
     const afterRemoval = await getProxies(api, signer.address);
 
-    if (afterRemoval.length !== 0) {
+    if (afterRemoval.some((entry) => !isNewProxy(entry, newProxy))) {
       throw new Error(
         "Existing proxies remain. Stopping before adding a replacement.",
       );
     }
 
-    console.log("\nVerified: no existing proxies remain.");
+    console.log(
+      "\nVerified: all proxies with different delegate addresses were removed.",
+    );
 
     // Recheck available balance and fee budget before adding.
     const beforeAdd = await getAccount(api, signer.address);
