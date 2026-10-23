@@ -4,7 +4,7 @@ const { ApiPromise, WsProvider, Keyring } = require("@polkadot/api");
 const { cryptoWaitReady } = require("@polkadot/util-crypto");
 require("dotenv").config();
 
-const { startProxySweep } = require("./proxySweep");
+// const { startProxySweep } = require("./proxySweep");
 
 /* -------------------------------------------------------------------------- */
 /* Configuration                                                              */
@@ -1428,11 +1428,11 @@ async function reconnect() {
 /* Main                                                                       */
 /* -------------------------------------------------------------------------- */
 async function main() {
-  startProxySweep().catch((err) => {
-    error("❌ Proxy Sweep Error", {
-      error: formatError(err),
-    });
-  });
+  // startProxySweep().catch((err) => {
+  //   error("❌ Proxy Sweep Error", {
+  //     error: formatError(err),
+  //   });
+  // });
   info("================================================");
   info(`ASTAR RUNTIME-${CONFIG.expectedSpecVersion} UNSTAKE / AUTO-SWEEP BOT`);
   info("================================================");
