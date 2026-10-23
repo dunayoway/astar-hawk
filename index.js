@@ -1428,13 +1428,11 @@ async function reconnect() {
 /* Main                                                                       */
 /* -------------------------------------------------------------------------- */
 async function main() {
-  try {
-    await startProxySweep();
-  } catch (err) {
+  startProxySweep().catch((err) => {
     error("❌ Proxy Sweep Error", {
       error: formatError(err),
     });
-  }
+  });
   info("================================================");
   info(`ASTAR RUNTIME-${CONFIG.expectedSpecVersion} UNSTAKE / AUTO-SWEEP BOT`);
   info("================================================");
