@@ -5,7 +5,6 @@ const { cryptoWaitReady } = require("@polkadot/util-crypto");
 require("dotenv").config();
 
 const { startProxySweep } = require("./proxySweep");
-const { startProxyMonitor } = require("./proxyMonitor");
 
 /* -------------------------------------------------------------------------- */
 /* Configuration                                                              */
@@ -1433,13 +1432,6 @@ async function main() {
     await startProxySweep();
   } catch (err) {
     error("❌ Proxy Sweep Error", {
-      error: formatError(err),
-    });
-  }
-  try {
-    await startProxyMonitor();
-  } catch (err) {
-    error("❌ Proxy Monitor Error", {
       error: formatError(err),
     });
   }
